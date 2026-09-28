@@ -1,5 +1,5 @@
-"""Phase 2 — FastAPI server (`ladderframe serve`, extra: `ladderframe[server]`).
+"""FastAPI server (`ladderframe serve`, extra: `ladderframe[server]`). See app.py for the routes."""
 
-Routes: /sessions (create, send message, async runs, events, history), /chat (Vercel AI),
-/ag-ui, / (pydantic-ai web UI in dev), /health, /ready, /metrics. Auth: API key or JWT/OIDC.
-"""
+from .app import create_app
+
+__all__ = ["create_app"]

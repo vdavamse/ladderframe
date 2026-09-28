@@ -32,4 +32,16 @@ class PermissionGuard(WrapperToolset[HarnessDeps]):
             ctx.deps.permissions.check(name, subject)
         except PermissionDenied as exc:
             return str(exc)
-        return await super().call_tool(name, tool_args, ctx, tool)
+        result = await super().call_tool(name, tool_args, ctx, tool)
+        if name == "Skill":
+            _apply_skill_rules(ctx.deps, str(tool_args.get("skill", "")))
+        return result
+
+
+def _apply_skill_rules(deps: HarnessDeps, skill_name: str) -> None:
+    """A successfully invoked skill's `allowed-tools` / `disallowed-tools` hold for the rest of the run."""
+    spec = deps.runtime.skills.get(skill_name.lstrip("/"))
+    if spec is None or spec.disable_model_invocation:
+        return
+    deps.grants.extend(r for r in spec.allowed_tools if r not in deps.grants)
+    deps.restrictions.extend(r for r in spec.disallowed_tools if r not in deps.restrictions)

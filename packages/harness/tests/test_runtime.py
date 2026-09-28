@@ -1,9 +1,11 @@
+from conftest import streaming
 from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from ladderframe import Runtime
 from ladderframe.core.check import check_runtime
 from ladderframe.runtime.inline import InlineExecutor
+from ladderframe.storage import MemoryObjectStore
 
 
 def scripted(*calls: tuple[str, dict]) -> FunctionModel:
@@ -18,7 +20,7 @@ def scripted(*calls: tuple[str, dict]) -> FunctionModel:
         last = [p for m in messages for p in getattr(m, "parts", []) if isinstance(p, results)]
         return ModelResponse(parts=[TextPart(str(last[-1].content) if last else "done")])
 
-    return FunctionModel(respond)
+    return streaming(respond)
 
 
 def test_discovery(runtime: Runtime) -> None:
@@ -65,7 +67,7 @@ async def test_skill_renders_inline(runtime: Runtime) -> None:
 
 
 async def test_agent_tool_runs_subagent(runtime: Runtime) -> None:
-    helper, _ = runtime.subagent(runtime.subagents["helper"], runtime.config.tools)
+    helper, _ = runtime.subagent(runtime.subagents["helper"])
     main = scripted(("Agent", {"description": "echo", "prompt": "say x", "subagent_type": "helper"}))
     with runtime.agent.override(model=main), helper.override(model=scripted(("Echo", {"text": "from helper"}))):
         result = await runtime.run("delegate")
@@ -79,10 +81,13 @@ async def test_agent_tool_rejects_disallowed_type(runtime: Runtime) -> None:
     assert "disallowed agent type" in result.output
 
 
-async def test_inline_sessions_persist(runtime: Runtime, tmp_path) -> None:
+async def test_inline_executor_keeps_history(runtime: Runtime) -> None:
+    runtime.object_store = MemoryObjectStore()
     executor = InlineExecutor(runtime)
-    executor.sessions.directory = tmp_path
     with runtime.agent.override(model=scripted()):
-        session_id, _ = await executor.send("first")
-        await executor.send("second", session_id)
-    assert len(executor.sessions.load(session_id)) == 4
+        first = await executor.send("s1", "first")
+        second = await executor.send("s1", "second")
+    assert first.status == second.status == "done"
+    assert len(await executor.history("s1")) == 4
+    [meta] = await executor.sessions()
+    assert meta.turns == 2

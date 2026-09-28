@@ -5,8 +5,8 @@
     ladderframe [--root DIR] check
     ladderframe [--root DIR] boot [--dry-run]
     ladderframe [--root DIR] cron
-    ladderframe [--root DIR] serve        (phase 2)
-    ladderframe [--root DIR] worker       (phase 2)
+    ladderframe [--root DIR] serve [--host H] [--port P] [--no-worker]
+    ladderframe [--root DIR] worker
 
 The root is `--root`, else `$LADDERFRAME_ROOT`, else the current directory.
 """
@@ -17,20 +17,15 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import AsyncIterable
 from typing import Any
 
-from pydantic_ai import RunContext
 from pydantic_ai.messages import (
-    AgentStreamEvent,
     FunctionToolCallEvent,
     PartDeltaEvent,
     PartStartEvent,
     TextPart,
     TextPartDelta,
 )
-
-from .core.deps import HarnessDeps
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -54,20 +49,22 @@ def _parser() -> argparse.ArgumentParser:
     boot.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("cron", help="exec supercronic with the merged etc/cron.d crontab")
-    sub.add_parser("serve", help="HTTP server (phase 2)")
-    sub.add_parser("worker", help="Temporal worker (phase 2)")
+    serve = sub.add_parser("serve", help="HTTP server (+ Temporal worker when runtime.executor is temporal)")
+    serve.add_argument("--host", help="default: server.host")
+    serve.add_argument("--port", type=int, help="default: server.port")
+    serve.add_argument("--no-worker", action="store_true", help="do not run the Temporal worker in this process")
+    sub.add_parser("worker", help="Temporal worker only")
     return parser
 
 
-async def _print_events(_ctx: RunContext[HarnessDeps], events: AsyncIterable[AgentStreamEvent]) -> None:
-    async for event in events:
-        if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-            sys.stdout.write(event.part.content)
-        elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-            sys.stdout.write(event.delta.content_delta)
-        elif isinstance(event, FunctionToolCallEvent):
-            sys.stderr.write(f"\n  ⎿ {event.part.tool_name}({_short_args(event.part.args)})\n")
-        sys.stdout.flush()
+def _print_event(event: Any) -> None:
+    if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+        sys.stdout.write(event.part.content)
+    elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+        sys.stdout.write(event.delta.content_delta)
+    elif isinstance(event, FunctionToolCallEvent):
+        sys.stderr.write(f"\n  ⎿ {event.part.tool_name}({_short_args(event.part.args)})\n")
+    sys.stdout.flush()
 
 
 def _short_args(args: Any, limit: int = 80) -> str:
@@ -81,39 +78,71 @@ def _load(args: argparse.Namespace):  # noqa: ANN202
     return Runtime.load(args.root, args.profile)
 
 
-async def _run(args: argparse.Namespace) -> int:
+def _executor(runtime: Any) -> Any:
+    """The configured executor: in-process, or a Temporal session (needs a running worker)."""
+    if runtime.config.runtime.executor == "temporal":
+        from .runtime.temporal.executor import TemporalExecutor
+
+        return TemporalExecutor(runtime)
     from .runtime.inline import InlineExecutor
 
-    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
-    executor = InlineExecutor(_load(args))
-    if args.quiet:
-        _, output = await executor.send(prompt, args.session)
-        print(output)
-    else:
-        session_id, _ = await executor.send(prompt, args.session, event_stream_handler=_print_events)
-        print(f"\n\n[session: {session_id}]", file=sys.stderr)
+    return InlineExecutor(runtime)
+
+
+async def _turn(executor: Any, session_id: str, prompt: str, quiet: bool) -> int:
+    from .runtime.executor import TurnFailed
+
+    turn = await executor.submit(session_id, prompt)
+    if quiet:
+        state = await executor.wait(session_id, turn.turn_id)
+        print(state.output if state.status == "done" else f"error: {state.error}")
+        return 0 if state.status == "done" else 1
+    try:
+        async for event in executor.events(session_id, turn.turn_id):
+            _print_event(event)
+    except TurnFailed as exc:
+        print(f"\nerror: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
+async def _run(args: argparse.Namespace) -> int:
+    from .runtime.executor import new_id
+
+    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+    executor = _executor(_load(args))
+    await executor.start()
+    session_id = args.session or new_id()
+    code = await _turn(executor, session_id, prompt, args.quiet)
+    if not args.quiet:
+        print(f"\n\n[session: {session_id}]", file=sys.stderr)
+    await executor.aclose()
+    return code
+
+
 async def _repl(args: argparse.Namespace) -> int:
-    from .runtime.inline import InlineExecutor
+    from .runtime.executor import new_id
 
     runtime = _load(args)
-    executor = InlineExecutor(runtime)
-    session_id = args.session
-    print(f"{runtime.name} — {runtime.config.resolve_model()}  (Ctrl-D to exit)", file=sys.stderr)
+    executor = _executor(runtime)
+    await executor.start()
+    session_id = args.session or new_id()
+    print(
+        f"{runtime.name} — {runtime.config.resolve_model()} — session {session_id}  (Ctrl-D to exit)", file=sys.stderr
+    )
     while True:
         try:
             prompt = input("\n› ").strip()
         except (EOFError, KeyboardInterrupt):
             print(file=sys.stderr)
+            await executor.aclose()
             return 0
         if not prompt:
             continue
         if prompt.startswith("/") and (name := prompt[1:].split(" ", 1)[0]) in runtime.skills:
             skill_args = prompt[len(name) + 1 :].strip()
             prompt = await runtime.render_skill(runtime.skills[name], skill_args, runtime.new_deps(session_id))
-        session_id, _ = await executor.send(prompt, session_id, event_stream_handler=_print_events)
+        await _turn(executor, session_id, prompt, False)
         print()
 
 
@@ -154,8 +183,26 @@ def main(argv: list[str] | None = None) -> int:
 
         exec_supercronic(build_crontab(runtime.root, runtime.share), runtime.root)
         return 0
-    print(f"`ladderframe {command}` is planned for phase 2 (FastAPI server + Temporal worker).", file=sys.stderr)
+    if command == "serve":
+        return _serve(args)
+    if command == "worker":
+        from .server.serve import run_worker
+
+        asyncio.run(run_worker(_load(args)))
+        return 0
     return 2
+
+
+def _serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from .server.serve import build_app
+
+    runtime = _load(args)
+    server = runtime.config.server
+    app = build_app(runtime, with_worker=not args.no_worker)
+    uvicorn.run(app, host=args.host or server.host, port=args.port or server.port, log_level="info")
+    return 0
 
 
 if __name__ == "__main__":

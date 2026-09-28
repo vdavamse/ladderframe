@@ -38,11 +38,9 @@ async def Skill(ctx: RunContext[HarnessDeps], skill: str, args: str | None = Non
     if spec.disable_model_invocation:
         return f"Skill {spec.name!r} can only be invoked by the user."
 
+    # `allowed-tools` / `disallowed-tools` are applied by PermissionGuard once this call returns: it runs
+    # on the workflow side under Temporal, where mutating deps here (inside an activity) would be lost.
     rendered = await runtime.render_skill(spec, args or "", ctx.deps)
-    if spec.allowed_tools:
-        ctx.deps.permissions.grant(spec.allowed_tools)
-    if spec.disallowed_tools:
-        ctx.deps.permissions.restrict(spec.disallowed_tools)
     if spec.context == "fork":
         return await runtime.run_forked_skill(spec, rendered, ctx.deps)
     return f'<skill name="{spec.name}" directory="{spec.directory}">\n{rendered}\n</skill>'

@@ -59,6 +59,8 @@ class StorageConfig(_Model):
     secret_key: str | None = None
     region: str = "us-east-1"
     payload_prefix: str = "payloads/"
+    payload_threshold_bytes: int = 256 * 1024
+    """Temporal payloads at least this large are stored here instead of in workflow history."""
     session_prefix: str = "sessions/"
 
 

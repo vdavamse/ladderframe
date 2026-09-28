@@ -83,3 +83,17 @@ def load_config(etc_dir: Path, profile: str | None = None, missing: set[str] | N
         return HarnessConfig.model_validate(expand_env_vars(data, missing))
     except ValueError as exc:
         raise ConfigError(f"{base}: {exc}") from exc
+
+
+_DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*$")
+_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(value: str | float | int) -> float:
+    """`90`, `90s`, `15m`, `2h`, `7d`, `1w` -> seconds."""
+    if isinstance(value, int | float):
+        return float(value)
+    match = _DURATION.match(value)
+    if not match:
+        raise ConfigError(f"invalid duration {value!r}; use e.g. 30s, 15m, 2h, 7d")
+    return float(match.group(1)) * _UNITS[match.group(2)]

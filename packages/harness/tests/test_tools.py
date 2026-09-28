@@ -27,7 +27,7 @@ def test_glob(ctx: SimpleNamespace) -> None:
 async def test_grep(ctx: SimpleNamespace) -> None:
     out = await Grep(ctx, "needle", path="data", output_mode="content")
     assert "sample.txt:3:needle here" in out
-    fallback = _python_grep("needle", ctx.deps.workdir / "data", None, "files_with_matches", False, True, False)
+    fallback = _python_grep("needle", ctx.deps.workdir_path / "data", None, "files_with_matches", False, True, False)
     assert "sample.txt" in fallback
 
 

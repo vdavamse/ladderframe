@@ -36,7 +36,9 @@ async def _describe(ctx: RunContext[HarnessDeps], tool_def: ToolDefinition) -> T
     return replace(tool_def, description=_DESCRIPTION + listing)
 
 
-@tool(subject="subagent_type", prepare=_describe, aliases=("Task",))
+# `temporal: False` keeps this tool out of activities: inside a workflow it starts the sub-agent as a
+# child workflow, so the sub-agent's own model and tool calls are durable too.
+@tool(subject="subagent_type", prepare=_describe, aliases=("Task",), metadata={"temporal": False})
 async def Agent(ctx: RunContext[HarnessDeps], description: str, prompt: str, subagent_type: str) -> str:
     """Run a sub-agent.
 
@@ -50,4 +52,16 @@ async def Agent(ctx: RunContext[HarnessDeps], description: str, prompt: str, sub
     if subagent_type not in names:
         raise ModelRetry(f"Unknown or disallowed agent type {subagent_type!r}. Available: {', '.join(names) or 'none'}")
     spec = deps.runtime.subagents[subagent_type]
+    if _in_workflow():
+        from ..runtime.temporal.subagent_workflow import run_subagent_child
+
+        return await run_subagent_child(spec.name, prompt, deps)
     return await deps.runtime.run_subagent(spec, prompt, deps)
+
+
+def _in_workflow() -> bool:
+    try:
+        from temporalio import workflow
+    except ImportError:
+        return False
+    return workflow.in_workflow()

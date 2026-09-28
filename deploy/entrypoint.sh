@@ -10,5 +10,5 @@ if compgen -G "${LADDERFRAME_ROOT}/etc/cron.d/*" >/dev/null || compgen -G "${LAD
   trap 'kill "${CRON_PID}" 2>/dev/null || true' EXIT
 fi
 
-# Phase 2: `serve` starts FastAPI and the Temporal worker in the same process.
+# `serve` runs FastAPI and, with runtime.executor: temporal, the Temporal worker in the same process.
 exec ladderframe "${@:-serve}"

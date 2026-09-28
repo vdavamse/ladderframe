@@ -7,6 +7,7 @@ agent behaves the same however it is started.
 from __future__ import annotations
 
 import platform
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,7 +17,9 @@ from typing import Any, cast
 
 from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.agent.abstract import EventStreamHandler
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from pydantic_ai.usage import UsageLimits
@@ -26,15 +29,20 @@ from ..config import HarnessConfig, ModelConfig, load_config
 from ..core.deps import HarnessDeps
 from ..core.discovery import Discovered, discover, entry_point_tools
 from ..core.frontmatter import SkillSpec, SubagentSpec
-from ..core.permissions import Permissions, Rule, canonical_tool_name
+from ..core.permissions import Rule, canonical_tool_name
 from ..core.rootfs import AgentRoot, Layer, claude_layers
 from ..core.substitution import RenderContext, inject_shell_output, run_shell, substitute
 from ..mcp import MCPServerConfig, build_toolsets, load_mcp_config
+from ..storage.object_store import ObjectStore, open_object_store
 from ..tools import BUILTIN_TOOLS
 from ..tools.base import to_pydantic_tool
 from ..tools.guard import PermissionGuard
+from .registry import register_runtime
 
 HarnessAgent = Agent[HarnessDeps, str]
+
+EVENT_TOPIC = "agent-events"
+"""Workflow Stream topic the main agent publishes its events to when running under Temporal."""
 
 _GENERAL_PURPOSE = SubagentSpec(
     name="general-purpose",
@@ -63,6 +71,9 @@ class Runtime:
         discovered: Discovered,
         mcp_servers: dict[str, MCPServerConfig],
         missing_env: set[str],
+        *,
+        durable: bool | None = None,
+        model: Model | str | None = None,
     ) -> None:
         self.root = root
         self.config = config
@@ -73,12 +84,25 @@ class Runtime:
         self.name = config.name or root.name
         self.workdir = (Path.cwd() / Path(config.workdir).expanduser()).resolve()
         self.available_tools: dict[str, Callable[..., Any]] = self._tool_pool()
+        self.durable = config.runtime.executor == "temporal" if durable is None else durable
+        """Attach pydantic-ai `TemporalDurability` to every agent (required by the Temporal worker)."""
+        self.model_override = model
+        """Use this model for every agent instead of the configured ones (tests, local experiments)."""
         self._agents: dict[str, HarnessAgent] = {}
+        self._object_store: ObjectStore | None = None
+        register_runtime(self)
 
     # ------------------------------------------------------------------ loading
 
     @classmethod
-    def load(cls, root: str | Path | None = None, profile: str | None = None) -> Runtime:
+    def load(
+        cls,
+        root: str | Path | None = None,
+        profile: str | None = None,
+        *,
+        durable: bool | None = None,
+        model: Model | str | None = None,
+    ) -> Runtime:
         agent_root = AgentRoot.resolve(root)
         missing: set[str] = set()
         config = load_config(agent_root.etc, profile, missing)
@@ -88,7 +112,18 @@ class Runtime:
             layers += claude_layers(agent_root)
         discovered = discover(layers)
         mcp_servers = load_mcp_config([layer.mcp_yaml for layer in layers], missing)
-        return cls(agent_root, config, share, discovered, mcp_servers, missing)
+        return cls(agent_root, config, share, discovered, mcp_servers, missing, durable=durable, model=model)
+
+    @property
+    def object_store(self) -> ObjectStore:
+        """MinIO/S3 when `storage.endpoint` is set, else `<root>/var/lib/objects`. Assignable (tests)."""
+        if self._object_store is None:
+            self._object_store = open_object_store(self.config.storage, self.root.var_lib / "objects")
+        return self._object_store
+
+    @object_store.setter
+    def object_store(self, store: ObjectStore) -> None:
+        self._object_store = store
 
     @property
     def subagents(self) -> dict[str, SubagentSpec]:
@@ -152,6 +187,20 @@ class Runtime:
             total_tokens_limit=limits.total_tokens_limit,
         )
 
+    def agent_name(self, subagent: str | None = None) -> str:
+        """Stable, unique agent names; Temporal derives activity names from them."""
+        base = re.sub(r"[^A-Za-z0-9_.-]", "-", self.name)
+        return base if subagent is None else f"{base}--{re.sub(r'[^A-Za-z0-9_.-]', '-', subagent)}"
+
+    def _capabilities(self, main: bool) -> list[AbstractCapability[HarnessDeps]]:
+        capabilities: list[AbstractCapability[HarnessDeps]] = build_capabilities(self.config.capabilities)
+        if self.durable:
+            from pydantic_ai.durable_exec.temporal import TemporalDurability
+
+            # Only the main agent streams events: it runs in the session workflow, which hosts the stream.
+            capabilities.append(TemporalDurability(event_stream_topic=EVENT_TOPIC if main else None))
+        return capabilities
+
     def _build(
         self,
         name: str,
@@ -159,18 +208,19 @@ class Runtime:
         tools: dict[str, Callable[..., Any]],
         mcp_toolsets: list[AbstractToolset[Any]],
         model: str | None,
+        main: bool,
     ) -> HarnessAgent:
-        function_toolset = FunctionToolset[HarnessDeps]([to_pydantic_tool(fn) for fn in tools.values()])
+        function_toolset = FunctionToolset[HarnessDeps]([to_pydantic_tool(fn) for fn in tools.values()], id="tools")
         toolsets: list[AbstractToolset[HarnessDeps]] = [PermissionGuard(function_toolset, functions=tools)]
         toolsets += [PermissionGuard(ts) for ts in mcp_toolsets]
         return Agent(
-            self.config.resolve_model(model),
+            self.model_override or self.config.resolve_model(model),
             name=name,
             instructions=instructions,
             deps_type=HarnessDeps,
             output_type=str,
             toolsets=toolsets,
-            capabilities=build_capabilities(self.config.capabilities),
+            capabilities=self._capabilities(main),
             model_settings=self._model_settings(),
             defer_model_check=True,
         )
@@ -184,12 +234,14 @@ class Runtime:
                 raise RuntimeConfigError(f"unknown tools in etc/ladderframe.yaml: {', '.join(selection.unknown)}")
             instructions = f"{self.personality()}\n\n{self.environment_block()}"
             self._agents["__main__"] = self._build(
-                self.name, instructions, selection.functions, build_toolsets(self.mcp_servers), None
+                self.agent_name(), instructions, selection.functions, build_toolsets(self.mcp_servers), None, True
             )
         return self._agents["__main__"]
 
-    def subagent(self, spec: SubagentSpec, parent_tools: list[str]) -> tuple[HarnessAgent, ToolSelection]:
-        selection = self.select_tools(spec.tools if spec.tools is not None else parent_tools, spec.disallowed_tools)
+    def subagent(self, spec: SubagentSpec) -> tuple[HarnessAgent, ToolSelection]:
+        """The sub-agent's pydantic-ai agent; without `tools` it inherits the main agent's tool list."""
+        entries = spec.tools if spec.tools is not None else self.config.tools
+        selection = self.select_tools(entries, spec.disallowed_tools)
         key = f"sub:{spec.name}"
         if key not in self._agents:
             parts = [] if spec.extra.get("omitClaudeMd") else [self.personality()]
@@ -200,9 +252,18 @@ class Runtime:
             parts.append(self.environment_block())
             model = None if spec.model in (None, "inherit") else spec.model
             self._agents[key] = self._build(
-                spec.name, "\n\n".join(p for p in parts if p), selection.functions, self._subagent_mcp(spec), model
+                self.agent_name(spec.name),
+                "\n\n".join(p for p in parts if p),
+                selection.functions,
+                self._subagent_mcp(spec),
+                model,
+                False,
             )
         return self._agents[key], selection
+
+    def all_agents(self) -> list[HarnessAgent]:
+        """The main agent and every sub-agent, built eagerly (the Temporal worker registers their activities)."""
+        return [self.agent, *(self.subagent(spec)[0] for spec in self.subagents.values())]
 
     def _subagent_mcp(self, spec: SubagentSpec) -> list[AbstractToolset[Any]]:
         """Sub-agents get only the MCP servers they name (or define inline) in `mcpServers`."""
@@ -219,13 +280,9 @@ class Runtime:
     # ------------------------------------------------------------------ running
 
     def new_deps(self, session_id: str | None = None) -> HarnessDeps:
-        permissions = self.config.permissions
         return HarnessDeps(
-            runtime=self,
-            root=self.root,
-            config=self.config,
-            permissions=Permissions.from_config(permissions.default, permissions.allow, permissions.deny),
-            workdir=self.workdir,
+            root_path=str(self.root.path),
+            workdir=str(self.workdir),
             session_id=session_id or uuid.uuid4().hex,
             allowed_subagents=self.select_tools(self.config.tools).allowed_subagents,
         )
@@ -247,24 +304,16 @@ class Runtime:
         )
 
     async def run_subagent(self, spec: SubagentSpec, prompt: str, parent: HarnessDeps) -> str:
-        agent, selection = self.subagent(spec, self.config.tools)
-        deps = HarnessDeps(
-            runtime=self,
-            root=self.root,
-            config=self.config,
-            permissions=parent.permissions.child(),
-            workdir=parent.workdir,
-            session_id=parent.session_id,
-            depth=parent.depth + 1,
-            allowed_subagents=selection.allowed_subagents,
-        )
+        """Run a sub-agent in-process. Inside a Temporal workflow the Agent tool uses a child workflow instead."""
+        agent, selection = self.subagent(spec)
+        deps = parent.child(selection.allowed_subagents)
         result = await agent.run(prompt, deps=deps, usage_limits=self.usage_limits(spec.max_turns))
         return result.output
 
     async def render_skill(self, spec: SkillSpec, arguments: str, deps: HarnessDeps) -> str:
         ctx = RenderContext(
             skill_dir=str(spec.directory or ""),
-            project_dir=str(deps.workdir),
+            project_dir=deps.workdir,
             agent_root=str(self.root.path),
             session_id=deps.session_id,
         )
@@ -272,7 +321,7 @@ class Runtime:
 
         async def runner(command: str) -> str:
             deps.permissions.check("Bash", command)
-            return await run_shell(command, cwd=str(deps.workdir))
+            return await run_shell(command, cwd=deps.workdir)
 
         return await inject_shell_output(text, None if self.config.disable_skill_shell_execution else runner)
 

@@ -16,9 +16,9 @@ ladderframe/
 │       ├── tools/             # Read Bash Glob Grep WebFetch WebSearch Agent Skill (+ @tool decorator)
 │       ├── mcp/               # mcp.yaml -> pydantic-ai MCPToolset
 │       ├── capabilities/      # YAML names -> pydantic-ai capabilities (prompt_injection_defender, ...)
-│       ├── runtime/           # Runtime + inline executor; temporal/ (phase 2)
-│       ├── server/            # FastAPI (phase 2)
-│       ├── storage/           # MinIO/S3 (phase 2)
+│       ├── runtime/           # Runtime, executors (inline, temporal/: session + sub-agent workflows)
+│       ├── server/            # FastAPI: sessions API, Vercel AI, AG-UI, dev web UI, API-key auth
+│       ├── storage/           # object store (MinIO/S3, files, memory), session archive
 │       └── system/            # init.d runner, cron.d -> supercronic
 ├── agents/
 │   └── coder/                 # an agent root
@@ -52,10 +52,13 @@ uv run ladderframe --root agents/coder run "What does this repo do?"
 uv run ladderframe --root agents/coder repl           # interactive; /fix-issue 42 runs a skill
 uv run ladderframe --root agents/coder boot           # run etc/init.d (installs jq, mq, rg, gh, supercronic)
 uv run ladderframe --root agents/coder cron           # supercronic with the merged etc/cron.d
+uv run ladderframe --root agents/coder serve          # HTTP API on :8080 (+ Temporal worker if configured)
+uv run ladderframe --root agents/coder worker         # Temporal worker only
 ```
 
-The root is `--root`, else `$LADDERFRAME_ROOT`, else the current directory. Sessions from `run --session <id>`
-and `repl` are stored in `<root>/var/lib/sessions/` by the inline executor.
+The root is `--root`, else `$LADDERFRAME_ROOT`, else the current directory. `run`, `repl` and `serve` use the
+executor from `runtime.executor`. With `inline`, sessions are stored under `<root>/var/lib/objects/sessions/`
+(or in S3/MinIO when `storage.endpoint` is set).
 
 ## Configuration — `etc/ladderframe.yaml`
 
@@ -161,27 +164,62 @@ Tools can also ship in a package through the `ladderframe.tools` entry-point gro
 with `tool_packages: [my-package]`. Capabilities use the `ladderframe.capabilities` group or a
 `module:Class` path.
 
+## HTTP API — `ladderframe serve`
+
+| Method & path | |
+|---|---|
+| `GET /health`, `GET /ready` | liveness; readiness checks object storage and Temporal |
+| `POST /v1/sessions` | new session id (the session starts with its first message) |
+| `GET /v1/sessions` | sessions, filtered by `X-User-Id` |
+| `POST /v1/sessions/{id}/messages` | `{"prompt": "...", "mode": "wait" \| "async" \| "stream"}`: wait for the answer, get `202` + turn id, or server-sent events |
+| `GET /v1/sessions/{id}/messages` | history as pydantic-ai messages |
+| `GET /v1/sessions/{id}/turns/{turn}` and `.../events` | turn status; turn events as SSE (ends with `event: result`) |
+| `DELETE /v1/sessions/{id}` | close the session |
+| `POST /chat` | Vercel AI SDK data stream (`useChat({api: "/chat"})`); the chat `id` is the session id |
+| `POST /ag-ui` | AG-UI; the thread id is the session id |
+| `GET /` | pydantic-ai chat UI — development only: it runs the agent directly, not through the executor |
+
+`server.protocols` selects `vercel-ai`, `ag-ui` and `web`. `server.auth: api-key` accepts
+`Authorization: Bearer <key>` or `X-API-Key`; `X-User-Id` names the end user. The UI protocols send the
+whole conversation, but only the latest user message is submitted: the session keeps its own history.
+
 ## Runtime and deployment
 
-- **One agent per pod.** The image contains the harness, one agent root and `share/`
-  (`docker build -f deploy/Dockerfile --build-arg AGENT=coder .`).
-- **Entrypoint:** `ladderframe boot`, then `ladderframe cron` in the background, then
-  `ladderframe serve` (FastAPI + Temporal worker in one process).
-- **Temporal (self-hosted)** holds sessions (one entity workflow per session), durable execution and
-  async runs. **MinIO** stores session snapshots (`sessions/`, kept) and offloaded Temporal payloads
-  (`payloads/`, expired by `deploy/minio/lifecycle.json` after 45 days; keep this longer than the
-  namespace retention, 30 days in the compose file).
+- **One agent per pod.** `ladderframe serve` runs the HTTP API and the Temporal worker for task queue
+  `ladderframe-<agent>` in one process; supercronic runs alongside (`deploy/entrypoint.sh`). Cron jobs call
+  `ladderframe run`, which goes through the same executor, so scheduled runs are durable too.
+- **Sessions are Temporal entity workflows** (`session:<agent>:<id>`): update `submit` queues a turn, update
+  `wait` returns its result, query `turn` reports status, signal `close` ends it. Each turn runs the main agent
+  with pydantic-ai's `TemporalDurability`, so model requests and tool calls are activities.
+- **Events** go through the session's Temporal Workflow Stream (`AgentEventStream`), read with
+  `stream_agent_events`; each turn truncates the previous turn's events so workflow state stays small.
+- **Sub-agents** started by the `Agent` tool run as child workflows (`ladderframe.Subagent`). Forked skills
+  (`context: fork`) run inside the Skill tool's activity and are not durable step by step.
+- **Object storage** (one bucket): `sessions/<agent>/<id>/` gets a history snapshot after every turn
+  (kept), and Temporal payloads over `storage.payload_threshold_bytes` (256 KiB) go to `payloads/` through
+  Temporal External Storage. Continue-as-new carries only the snapshot key. Idle sessions complete after
+  `session_idle_timeout` (default 7d); the next message restarts the workflow from the snapshot.
+- **Payload expiry:** `deploy/minio/lifecycle.json` expires `payloads/` after 45 days — keep it longer than
+  the namespace retention (30 days in the compose file), or old workflows can no longer replay.
+- **MinIO images:** MinIO no longer publishes free container images; set `MINIO_IMAGE` / `MINIO_MC_IMAGE`
+  for `deploy/docker-compose.yaml` to a build or registry you have access to.
+
+Durability notes:
+
+- Tool dependencies (`HarnessDeps`) are plain data so they can cross into activities; tools reach the
+  runtime (config, agents, skills) through a per-process registry.
+- A skill's `allowed-tools` / `disallowed-tools` are applied by the permission guard in workflow code,
+  so they hold for the rest of the turn under Temporal as well.
+- Keep agent names, sub-agent names, tool names and MCP server names stable while sessions are open:
+  Temporal activity names are derived from them.
 
 ## Status
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Config + profiles, discovery, frontmatter, permissions, all 8 tools, skills, sub-agents, MCP, capabilities, inline runtime, CLI (`run`, `repl`, `check`, `boot`, `cron`), init.d/cron.d | done |
-| 2 | FastAPI server (Vercel AI / AG-UI / web), auth, Temporal session workflow + worker, MinIO storage, OpenTelemetry | stubs + design notes in `runtime/temporal/__init__.py` |
-| 3 | Bash sandboxing, pydantic-evals in CI, Helm chart | planned |
-
-Until phase 2 lands, `ladderframe serve` and `ladderframe worker` exit with a notice, so the Docker
-entrypoint is not usable yet.
+| 1 | Config + profiles, discovery, frontmatter, permissions, all 8 tools, skills, sub-agents, MCP, capabilities, inline runtime, CLI, init.d/cron.d | done |
+| 2 | Temporal sessions/sub-agents/events, object storage + payload offloading, FastAPI (sessions API, Vercel AI, AG-UI, web), API-key auth, `serve`/`worker` | done |
+| 3 | JWT/OIDC auth, OpenTelemetry/Logfire + metrics, Bash sandboxing, pydantic-evals in CI, Helm chart | planned |
 
 ## Development
 

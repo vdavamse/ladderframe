@@ -59,6 +59,22 @@ def check_runtime(runtime: Runtime) -> Report:
         except Exception as exc:  # noqa: BLE001
             report.errors.append(f"capability {name!r}: {exc}")
 
+    config = runtime.config
+    if config.runtime.executor == "temporal":
+        if not config.storage.endpoint:
+            report.warnings.append(
+                "runtime.executor is temporal but storage.endpoint is unset: sessions and large payloads "
+                "go to local files, which other pods and restarts will not see"
+            )
+        try:
+            import temporalio  # noqa: F401
+        except ImportError:
+            report.errors.append("runtime.executor is temporal but `ladderframe[temporal]` is not installed")
+    if config.server.auth == "api-key" and not any(config.server.api_keys):
+        report.errors.append("server.auth is api-key but server.api_keys is empty")
+    if config.server.auth == "jwt":
+        report.errors.append("server.auth: jwt is not implemented yet")
+
     if runtime.missing_env:
         report.warnings.append(f"undefined environment variables: {', '.join(sorted(runtime.missing_env))}")
 
