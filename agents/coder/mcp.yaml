@@ -1,0 +1,23 @@
+# MCP servers for this agent — pydantic-ai `load_mcp_toolsets()` format, as YAML.
+#   command -> stdio        url -> streamable HTTP (SSE if the path ends in /sse)
+#   ${VAR} / ${VAR:-default} expand from the environment; ${AGENT_ROOT} is always set.
+# ladderframe extras (ignored by pydantic-ai): options, prefix, tools, enabled.
+# Tools are named <prefix>_<tool>, e.g. github_create_issue; permission rules can use `github_*`.
+
+mcpServers:
+  github:
+    command: github-mcp-server
+    args: [stdio, --read-only]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    tools: [get_*, list_*, search_*]     # allowlist of the server's own tool names
+    enabled: false                       # flip to true once the binary and token are available
+
+  context7:
+    url: https://mcp.context7.com/mcp
+    headers:
+      CONTEXT7_API_KEY: ${CONTEXT7_API_KEY:-}
+    options:                             # MCPToolset(**options)
+      include_instructions: true
+      read_timeout: 60
+    enabled: false

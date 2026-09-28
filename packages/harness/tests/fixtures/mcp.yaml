@@ -1,0 +1,13 @@
+mcpServers:
+  local:
+    command: my-server
+    args: [--flag]
+    tools: [read_*]
+  remote:
+    url: http://localhost:9999/mcp
+    prefix: rem
+    options: {read_timeout: 5}
+  offline:
+    url: http://localhost:1/mcp
+    headers: {Authorization: "Bearer ${NOT_SET_ANYWHERE}"}
+    enabled: false

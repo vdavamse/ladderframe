@@ -1,0 +1,53 @@
+# Built-in defaults. An agent root's etc/ladderframe.yaml is merged on top of this file,
+# and etc/ladderframe.<profile>.yaml (LADDERFRAME_PROFILE) on top of that.
+
+model: sonnet
+
+model_aliases:
+  sonnet: anthropic:claude-sonnet-5-5
+  opus: anthropic:claude-opus-5-5
+  fable: anthropic:claude-fable-5-1
+  haiku: anthropic:claude-haiku-4-5-20251001
+
+tools: [Read, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch]
+
+tool_settings:
+  Read:
+    max_lines: 2000
+    max_line_length: 2000
+  Bash:
+    timeout: 120
+    max_timeout: 600
+    max_output_chars: 30000
+  Grep:
+    head_limit: 250
+  Glob:
+    max_results: 1000
+  WebFetch:
+    max_content_length: 50000
+    timeout: 30
+    allow_local_urls: false
+  WebSearch:
+    backend: duckduckgo
+    max_results: 8
+
+permissions:
+  default: allow
+  allow: []
+  deny: []
+
+limits:
+  request_limit: 50
+  max_subagent_depth: 2
+
+share: true
+claude_compat: false
+
+runtime:
+  executor: inline
+
+server:
+  host: 127.0.0.1
+  port: 8080
+  protocols: [web]
+  auth: none

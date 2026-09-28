@@ -1,0 +1,7 @@
+name: fixture
+model: test
+share: false
+tools: [Read, Glob, Grep, Bash, Agent(helper), Skill, Echo]
+permissions:
+  default: allow
+  deny: [Bash(rm *)]

@@ -1,0 +1,3 @@
+# supercronic crontab (https://github.com/aptible/supercronic). Runs with cwd = agent root.
+# min hour dom mon dow  command
+0 7 * * 1-5  ladderframe run --quiet "Summarize yesterday's commits in this repository." >> var/log/daily-report.log 2>&1

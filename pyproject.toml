@@ -1,0 +1,50 @@
+[project]
+name = "ladderframe-workspace"
+version = "0.0.0"
+description = "Workspace root for the ladderframe agent harness (not a package)."
+requires-python = ">=3.12"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+ladderframe = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "ladderframe[all]",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+    "pyright>=1.1.390",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["UP046", "UP047"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ladderframe"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tools/*.py" = ["N802"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["packages"]
+asyncio_mode = "auto"
+
+[tool.pyright]
+include = ["packages"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"

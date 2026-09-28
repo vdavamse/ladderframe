@@ -1,0 +1,10 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-temporal-payloads",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "payloads/" },
+      "Expiration": { "Days": 45 }
+    }
+  ]
+}
