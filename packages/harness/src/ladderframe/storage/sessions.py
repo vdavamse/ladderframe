@@ -24,6 +24,14 @@ def validate_session_id(session_id: str) -> str:
     return session_id
 
 
+def count_user_turns(messages: list[ModelMessage]) -> int:
+    return sum(
+        1
+        for message in messages
+        if message.kind == "request" and any(part.part_kind == "user-prompt" for part in message.parts)
+    )
+
+
 class SessionMeta(BaseModel):
     session_id: str
     agent: str

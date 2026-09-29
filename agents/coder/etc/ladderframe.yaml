@@ -7,8 +7,7 @@ model: sonnet                       # alias, full id (claude-opus-5-5), or provi
 tools: [Read, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch, Hello]
 
 tool_settings:
-  Bash: {timeout: 120}
-  WebFetch: {summarize_model: haiku}
+  Bash: {timeout_ms: 120000}
   Hello: {greeting: Ahoj}
 
 permissions:

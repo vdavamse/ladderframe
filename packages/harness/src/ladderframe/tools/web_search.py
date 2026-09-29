@@ -1,77 +1,156 @@
+"""`WebSearch`: web search through Exa's or Parallel's hosted MCP endpoint, like opencode's websearch tool.
+
+No API key is needed; `EXA_API_KEY` / `PARALLEL_API_KEY` raise the rate limits. The result is the
+provider's LLM-oriented text, returned as-is.
+"""
+
 from __future__ import annotations
 
+import json
 import os
+import sys
+from dataclasses import replace
+from datetime import date
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote
 
+import httpx2
 from pydantic import BaseModel
 from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai.tools import ToolDefinition
 
 from ..core.deps import HarnessDeps
 from .base import tool
 
+DESCRIPTION = """- Search the web using the session's web search provider - performs real-time web searches and can scrape content from specific URLs
+- Provides up-to-date information for current events and recent data
+- Supports configurable result counts and returns the content from the most relevant websites
+- Use this tool for accessing information beyond knowledge cutoff
+- Searches are performed automatically within a single API call
+
+Usage notes:
+  - Supports live crawling modes when available: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
+  - Search types when available: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
+  - Configurable context length for optimal LLM integration
+  - Domain filtering and advanced search options available
+
+The current year is {year}. You MUST use this year when searching for recent information or current events
+- Example: If the current year is 2026 and the user asks for "latest AI news", search for "AI news 2026", NOT "AI news 2025\""""
+
+EXA_URL = "https://mcp.exa.ai/mcp"
+PARALLEL_URL = "https://search.parallel.ai/mcp"
+NO_RESULTS = "No search results found. Please try a different query."
+
 
 class WebSearchSettings(BaseModel):
-    backend: Literal["duckduckgo", "tavily"] = "duckduckgo"
-    max_results: int = 8
-    tavily_api_key: str | None = None
-    """Defaults to `$TAVILY_API_KEY`."""
+    provider: Literal["exa", "parallel"] = "exa"
+    """Overridden by `$LADDERFRAME_WEBSEARCH_PROVIDER`."""
+    timeout: float = 25
 
 
-@tool(settings=WebSearchSettings, subject="query")
+def _current_year() -> int:
+    if "temporalio" in sys.modules:
+        from temporalio import workflow
+
+        if workflow.in_workflow():
+            return workflow.now().year
+    return date.today().year
+
+
+async def _describe(ctx: RunContext[HarnessDeps], tool_def: ToolDefinition) -> ToolDefinition:
+    return replace(tool_def, description=DESCRIPTION.format(year=_current_year()))
+
+
+@tool(settings=WebSearchSettings, subject="query", prepare=_describe)
 async def WebSearch(
     ctx: RunContext[HarnessDeps],
     query: str,
-    allowed_domains: list[str] | None = None,
-    blocked_domains: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Search the web and return result titles, URLs and snippets.
+    numResults: int | None = None,
+    livecrawl: Literal["fallback", "preferred"] | None = None,
+    type: Literal["auto", "fast", "deep"] | None = None,
+    contextMaxCharacters: int | None = None,
+) -> str:
+    """Search the web.
 
     Args:
-        query: The search query.
-        allowed_domains: Only return results from these domains.
-        blocked_domains: Never return results from these domains.
+        query: Websearch query
+        numResults: Number of search results to return (default: 8)
+        livecrawl: Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')
+        type: Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search
+        contextMaxCharacters: Maximum characters for context string optimized for LLMs (default: 10000)
     """
     settings = ctx.deps.settings("WebSearch", WebSearchSettings)
-    if settings.backend == "tavily":
-        results = await _tavily(query, settings, allowed_domains, blocked_domains)
+    provider = os.environ.get("LADDERFRAME_WEBSEARCH_PROVIDER") or settings.provider
+    if provider == "parallel":
+        headers = {"User-Agent": f"ladderframe/{_version()}"}
+        if key := os.environ.get("PARALLEL_API_KEY"):
+            headers["Authorization"] = f"Bearer {key}"
+        arguments: dict[str, Any] = {
+            "objective": query,
+            "search_queries": [query],
+            "session_id": ctx.deps.session_id,
+        }
+        result = await call_mcp(PARALLEL_URL, "web_search", arguments, settings.timeout, headers)
     else:
-        results = await _duckduckgo(query, settings)
-    return [r for r in results if _domain_ok(r, allowed_domains, blocked_domains)]
+        url = EXA_URL
+        if key := os.environ.get("EXA_API_KEY"):
+            url = f"{EXA_URL}?exaApiKey={quote(key)}"
+        arguments = {
+            "query": query,
+            "type": type or "auto",
+            "numResults": numResults or 8,
+            "livecrawl": livecrawl or "fallback",
+        }
+        if contextMaxCharacters is not None:
+            arguments["contextMaxCharacters"] = contextMaxCharacters
+        result = await call_mcp(url, "web_search_exa", arguments, settings.timeout)
+    return result or NO_RESULTS
 
 
-async def _duckduckgo(query: str, settings: WebSearchSettings) -> list[dict[str, Any]]:
+async def call_mcp(
+    url: str, tool_name: str, arguments: dict[str, Any], timeout: float, headers: dict[str, str] | None = None
+) -> str | None:
+    """One stateless MCP `tools/call` over streamable HTTP; returns the first text content."""
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
     try:
-        from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
-    except ImportError as exc:
-        raise ModelRetry("WebSearch backend 'duckduckgo' needs `pip install 'ladderframe[search]'`.") from exc
-    search = duckduckgo_search_tool(max_results=settings.max_results)
-    return [dict(r) for r in await search.function(query)]  # type: ignore[call-arg]
+        async with httpx2.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                url,
+                json=request,
+                headers={"Accept": "application/json, text/event-stream", **(headers or {})},
+            )
+            response.raise_for_status()
+    except httpx2.TimeoutException as exc:
+        raise ModelRetry(f"{tool_name} request timed out") from exc
+    except httpx2.HTTPError as exc:
+        raise ModelRetry(f"{tool_name} request failed: {exc}") from exc
+    return parse_response(response.text)
 
 
-async def _tavily(
-    query: str, settings: WebSearchSettings, allowed: list[str] | None, blocked: list[str] | None
-) -> list[dict[str, Any]]:
+def parse_response(body: str) -> str | None:
+    if text := _parse_payload(body):
+        return text
+    for line in body.split("\n"):
+        if line.startswith("data: ") and (text := _parse_payload(line[6:])):
+            return text
+    return None
+
+
+def _parse_payload(payload: str) -> str | None:
+    payload = payload.strip()
+    if not payload.startswith("{"):
+        return None
     try:
-        from pydantic_ai.common_tools.tavily import tavily_search_tool
-    except ImportError as exc:
-        raise ModelRetry("WebSearch backend 'tavily' needs `pip install 'ladderframe[tavily]'`.") from exc
-    api_key = settings.tavily_api_key or os.environ.get("TAVILY_API_KEY")
-    if not api_key:
-        raise ModelRetry("WebSearch backend 'tavily' needs TAVILY_API_KEY.")
-    search = tavily_search_tool(
-        api_key, max_results=settings.max_results, include_domains=allowed, exclude_domains=blocked
-    )
-    return [dict(r) for r in await search.function(query)]  # type: ignore[call-arg]
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    content = ((data.get("result") or {}).get("content")) or []
+    return next((item["text"] for item in content if isinstance(item, dict) and item.get("text")), None)
 
 
-def _domain_ok(result: dict[str, Any], allowed: list[str] | None, blocked: list[str] | None) -> bool:
-    host = (urlparse(str(result.get("href") or result.get("url") or "")).hostname or "").lower()
-
-    def under(domain: str) -> bool:
-        domain = domain.lower().lstrip(".")
-        return host == domain or host.endswith("." + domain)
-
-    if blocked and any(under(d) for d in blocked):
-        return False
-    return not allowed or any(under(d) for d in allowed)
+def _version() -> str:
+    try:
+        return version("ladderframe")
+    except PackageNotFoundError:
+        return "0"

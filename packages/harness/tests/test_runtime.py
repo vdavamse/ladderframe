@@ -49,8 +49,13 @@ async def test_custom_tool_and_instructions(runtime: Runtime) -> None:
     assert result.output == "hi"
     tools = {t.name: t for t in seen["info"].function_tools}
     assert {"Read", "Echo", "Agent", "Skill"} <= set(tools)
-    assert "helper: Helps with things." in tools["Agent"].description
-    assert "greet: Greet someone." in tools["Skill"].description
+    assert "- helper: Helps with things." in tools["Agent"].description
+    assert "Available agent types and the tools they have access to:" in tools["Agent"].description
+    assert set(tools["Read"].parameters_json_schema["properties"]) == {"filePath", "offset", "limit"}
+    instructions = seen["info"].instructions or ""
+    assert "<available_skills>\n  <skill>\n    <name>greet</name>\n    <description>Greet someone.</description>" in (
+        instructions
+    )
 
 
 async def test_permission_denied_is_reported_to_model(runtime: Runtime) -> None:
@@ -59,11 +64,17 @@ async def test_permission_denied_is_reported_to_model(runtime: Runtime) -> None:
     assert "Permission denied: Bash" in result.output
 
 
-async def test_skill_renders_inline(runtime: Runtime) -> None:
-    with runtime.agent.override(model=scripted(("Skill", {"skill": "greet", "args": "Ada"}))):
+async def test_skill_loads_content(runtime: Runtime) -> None:
+    with runtime.agent.override(model=scripted(("Skill", {"name": "greet"}))):
         result = await runtime.run("greet Ada")
-    assert "Say hello to Ada from" in result.output
-    assert "skills/greet." in result.output
+    skill_dir = runtime.skills["greet"].directory
+    assert result.output == (
+        '<skill_content name="greet">\n# Skill: greet\n\n'
+        f"Say hello to  from {skill_dir}.\n\n"
+        f"Base directory for this skill: {skill_dir}\n"
+        "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.\n"
+        "Note: file list is sampled.\n\n<skill_files>\n\n</skill_files>\n</skill_content>"
+    )
 
 
 async def test_agent_tool_runs_subagent(runtime: Runtime) -> None:
@@ -71,14 +82,35 @@ async def test_agent_tool_runs_subagent(runtime: Runtime) -> None:
     main = scripted(("Agent", {"description": "echo", "prompt": "say x", "subagent_type": "helper"}))
     with runtime.agent.override(model=main), helper.override(model=scripted(("Echo", {"text": "from helper"}))):
         result = await runtime.run("delegate")
-    assert result.output == "echo: from helper"
+    assert result.output.startswith('<task id="task_')
+    assert result.output.endswith('" state="completed">\n<task_result>\necho: from helper\n</task_result>\n</task>')
+
+
+async def test_agent_tool_resumes_task(runtime: Runtime) -> None:
+    runtime.object_store = MemoryObjectStore()
+    helper, _ = runtime.subagent(runtime.subagents["helper"])
+    seen: list[int] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(len(messages))
+        return ModelResponse(parts=[TextPart("ok")])
+
+    call = {"description": "d", "prompt": "p", "subagent_type": "helper"}
+    with runtime.agent.override(model=scripted(("Agent", call))), helper.override(model=FunctionModel(respond)):
+        first = await runtime.run("go")
+    task_id = first.output.split('"')[1]
+    resume = {**call, "task_id": task_id}
+    with runtime.agent.override(model=scripted(("Agent", resume))), helper.override(model=FunctionModel(respond)):
+        second = await runtime.run("again")
+    assert f'<task id="{task_id}"' in second.output
+    assert seen == [1, 3]  # the resumed run saw the first prompt and answer
 
 
 async def test_agent_tool_rejects_disallowed_type(runtime: Runtime) -> None:
     calls = [("Agent", {"description": "x", "prompt": "x", "subagent_type": "general-purpose"})]
     with runtime.agent.override(model=scripted(*calls)):
         result = await runtime.run("delegate")
-    assert "disallowed agent type" in result.output
+    assert "Unknown agent type: general-purpose is not a valid agent type" in result.output
 
 
 async def test_inline_executor_keeps_history(runtime: Runtime) -> None:

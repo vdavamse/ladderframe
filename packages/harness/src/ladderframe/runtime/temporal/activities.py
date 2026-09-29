@@ -19,6 +19,8 @@ class LoadSessionInput:
     session_id: str
     snapshot_key: str | None = None
     """History key carried across continue-as-new; `None` loads the session's latest snapshot."""
+    tasks: bool = False
+    """A sub-agent (Agent tool) conversation rather than a user session."""
 
 
 @dataclass
@@ -31,16 +33,19 @@ class SaveSessionInput:
     turns: int = 0
     status: str = "open"
     usage: RunUsage = field(default_factory=RunUsage)
+    tasks: bool = False
+    agent: str | None = None
+    """Recorded in the meta; defaults to the archive's agent name (a sub-agent's name for tasks)."""
 
 
-def _archive(root_path: str) -> SessionArchive:
+def _archive(root_path: str, tasks: bool = False) -> SessionArchive:
     runtime = get_runtime(root_path)
-    return SessionArchive(runtime.object_store, runtime.agent_name(), runtime.config.storage.session_prefix)
+    return runtime.task_archive() if tasks else runtime.session_archive()
 
 
 @activity.defn(name="ladderframe.load_session")
 async def load_session(params: LoadSessionInput) -> list[ModelMessage]:
-    archive = _archive(params.root_path)
+    archive = _archive(params.root_path, params.tasks)
     if params.snapshot_key:
         return await archive.load_history(params.snapshot_key)
     return (await archive.load(params.session_id))[1]
@@ -49,9 +54,9 @@ async def load_session(params: LoadSessionInput) -> list[ModelMessage]:
 @activity.defn(name="ladderframe.save_session")
 async def save_session(params: SaveSessionInput) -> str:
     """Write the snapshot; returns the history key (what continue-as-new carries instead of the history)."""
-    archive = _archive(params.root_path)
+    archive = _archive(params.root_path, params.tasks)
     existing, _ = await archive.load(params.session_id)
-    meta = existing or SessionMeta(session_id=params.session_id, agent=archive.agent, user=params.user)
+    meta = existing or SessionMeta(session_id=params.session_id, agent=params.agent or archive.agent, user=params.user)
     meta.title = meta.title or params.title
     meta.turns = params.turns
     meta.messages = len(params.messages)
@@ -77,4 +82,19 @@ async def record_turn(params: TurnMetricsInput) -> None:
     record(get_runtime(params.root_path).agent_name(), params.status, params.duration_seconds, params.usage)
 
 
-ACTIVITIES = [load_session, save_session, record_turn]
+@dataclass
+class SaveToolOutputInput:
+    root_path: str
+    text: str
+
+
+@activity.defn(name="ladderframe.save_tool_output")
+async def save_tool_output(params: SaveToolOutputInput) -> str:
+    """Full text of a truncated tool result, written on the worker (see tools/guard.py)."""
+    from ...tools import truncate
+
+    deps = get_runtime(params.root_path).new_deps()
+    return truncate.write_output(truncate.output_dir(deps), params.text)
+
+
+ACTIVITIES = [load_session, save_session, record_turn, save_tool_output]

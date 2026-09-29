@@ -35,6 +35,15 @@ class LimitsConfig(_Model):
     tool_calls_limit: int | None = None
     total_tokens_limit: int | None = None
     max_subagent_depth: int = 2
+    tool_retries: int = 3
+    """Consecutive failed calls of one tool before the run fails (pydantic-ai `retries`)."""
+
+
+class ToolOutputConfig(_Model):
+    """Tool results over either limit are cut to a preview; the full output is saved under var/lib/tool-output/."""
+
+    max_lines: int = 2000
+    max_bytes: int = 50 * 1024
 
 
 class TemporalConfig(_Model):
@@ -120,6 +129,8 @@ class HarnessConfig(_Model):
 
     tool_settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
     """Per-tool settings, keyed by tool name, e.g. `{Bash: {timeout: 120}}`."""
+
+    tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
 
     tool_packages: list[str] = Field(default_factory=list)
     """Installed distributions whose `ladderframe.tools` entry points are enabled."""

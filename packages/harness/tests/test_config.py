@@ -25,7 +25,7 @@ def test_deep_merge_replaces_lists() -> None:
 def test_defaults_and_root_config() -> None:
     config = load_config(ETC)
     assert config.name == "fixture"
-    assert config.tool_settings["Bash"]["timeout"] == 120  # from defaults.yaml
+    assert config.tool_settings["Bash"]["timeout_ms"] == 120000  # from defaults.yaml
     assert config.resolve_model("sonnet") == "anthropic:claude-sonnet-5-5"
     assert config.resolve_model("claude-opus-5-5") == "anthropic:claude-opus-5-5"
 

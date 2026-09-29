@@ -6,12 +6,13 @@ agent behaves the same however it is started.
 
 from __future__ import annotations
 
+import html
 import platform
 import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ from ..core.rootfs import AgentRoot, Layer, claude_layers
 from ..core.substitution import RenderContext, inject_shell_output, run_shell, substitute
 from ..mcp import MCPServerConfig, build_toolsets, load_mcp_config
 from ..storage.object_store import ObjectStore, open_object_store
+from ..storage.sessions import SessionArchive, SessionMeta, count_user_turns
 from ..tools import BUILTIN_TOOLS
 from ..tools.base import to_pydantic_tool
 from ..tools.guard import PermissionGuard
@@ -125,6 +127,13 @@ class Runtime:
     def object_store(self, store: ObjectStore) -> None:
         self._object_store = store
 
+    def session_archive(self) -> SessionArchive:
+        return SessionArchive(self.object_store, self.agent_name(), self.config.storage.session_prefix)
+
+    def task_archive(self) -> SessionArchive:
+        """Sub-agent conversations started by the Agent tool, resumable by `task_id`."""
+        return SessionArchive(self.object_store, f"{self.agent_name()}.tasks", self.config.storage.session_prefix)
+
     @property
     def subagents(self) -> dict[str, SubagentSpec]:
         return {"general-purpose": _GENERAL_PURPOSE, **self.discovered.subagents}
@@ -166,6 +175,32 @@ class Runtime:
             f"platform: {platform.system().lower()}\n"
             f"date: {date.today().isoformat()}\n"
             "</environment>"
+        )
+
+    def skills_prompt(self) -> str:
+        """The `<available_skills>` system prompt section (opencode's format), for agents with the Skill tool."""
+        skills = sorted(
+            (s for s in self.skills.values() if s.description and not s.disable_model_invocation),
+            key=lambda s: s.name,
+        )
+        if not skills:
+            return ""
+        entries = [
+            "  <skill>\n"
+            f"    <name>{s.name}</name>\n"
+            f"    <description>{html.escape(s.listing, quote=False)}</description>\n"
+            f"    <location>{html.escape(str((s.directory or Path('.')) / 'SKILL.md'))}</location>\n"
+            "  </skill>"
+            for s in skills
+        ]
+        return "\n".join(
+            [
+                "Skills provide specialized instructions and workflows for specific tasks.",
+                "Use the Skill tool to load a skill when a task matches its description.",
+                "<available_skills>",
+                *entries,
+                "</available_skills>",
+            ]
         )
 
     def personality(self) -> str:
@@ -211,8 +246,11 @@ class Runtime:
         main: bool,
     ) -> HarnessAgent:
         function_toolset = FunctionToolset[HarnessDeps]([to_pydantic_tool(fn) for fn in tools.values()], id="tools")
-        toolsets: list[AbstractToolset[HarnessDeps]] = [PermissionGuard(function_toolset, functions=tools)]
-        toolsets += [PermissionGuard(ts) for ts in mcp_toolsets]
+        delegate = "Agent" in tools
+        toolsets: list[AbstractToolset[HarnessDeps]] = [
+            PermissionGuard(function_toolset, functions=tools, delegate=delegate)
+        ]
+        toolsets += [PermissionGuard(ts, delegate=delegate) for ts in mcp_toolsets]
         return Agent(
             self.model_override or self.config.resolve_model(model),
             name=name,
@@ -222,6 +260,7 @@ class Runtime:
             toolsets=toolsets,
             capabilities=self._capabilities(main),
             model_settings=self._model_settings(),
+            retries=self.config.limits.tool_retries,
             defer_model_check=True,
         )
 
@@ -232,7 +271,8 @@ class Runtime:
             selection = self.select_tools(self.config.tools)
             if selection.unknown:
                 raise RuntimeConfigError(f"unknown tools in etc/ladderframe.yaml: {', '.join(selection.unknown)}")
-            instructions = f"{self.personality()}\n\n{self.environment_block()}"
+            skills = self.skills_prompt() if "Skill" in selection.functions else ""
+            instructions = "\n\n".join(p for p in (self.personality(), skills, self.environment_block()) if p)
             self._agents["__main__"] = self._build(
                 self.agent_name(), instructions, selection.functions, build_toolsets(self.mcp_servers), None, True
             )
@@ -249,6 +289,8 @@ class Runtime:
             for skill_name in spec.skills:
                 if skill := self.skills.get(skill_name):
                     parts.append(f'<skill name="{skill.name}">\n{skill.body}\n</skill>')
+            if "Skill" in selection.functions:
+                parts.append(self.skills_prompt())
             parts.append(self.environment_block())
             model = None if spec.model in (None, "inherit") else spec.model
             self._agents[key] = self._build(
@@ -308,6 +350,33 @@ class Runtime:
         agent, selection = self.subagent(spec)
         deps = parent.child(selection.allowed_subagents)
         result = await agent.run(prompt, deps=deps, usage_limits=self.usage_limits(spec.max_turns))
+        return result.output
+
+    async def run_task(
+        self,
+        spec: SubagentSpec,
+        prompt: str,
+        parent: HarnessDeps,
+        task_id: str,
+        resume: bool = False,
+        description: str | None = None,
+    ) -> str:
+        """Run a sub-agent in-process for the Agent tool, continuing `task_id`'s conversation when `resume`."""
+        agent, selection = self.subagent(spec)
+        archive = self.task_archive()
+        meta, history = await archive.load(task_id) if resume else (None, [])
+        result = await agent.run(
+            prompt,
+            message_history=history,
+            deps=parent.child(selection.allowed_subagents),
+            usage_limits=self.usage_limits(spec.max_turns),
+        )
+        messages = result.all_messages()
+        meta = meta or SessionMeta(session_id=task_id, agent=spec.name, title=description)
+        meta.turns, meta.messages, meta.status = count_user_turns(messages), len(messages), "closed"
+        meta.usage = meta.usage + result.usage
+        meta.updated_at = datetime.now(UTC)
+        await archive.save(meta, messages)
         return result.output
 
     async def render_skill(self, spec: SkillSpec, arguments: str, deps: HarnessDeps) -> str:

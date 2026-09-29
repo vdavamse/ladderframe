@@ -113,7 +113,11 @@ async def test_events_stream_ends_with_result(env: tuple[Runtime, TemporalExecut
 async def test_subagent_runs_as_child_workflow(env: tuple[Runtime, TemporalExecutor]) -> None:
     runtime, executor = env
     turn = await executor.send("s4", "delegate:from child")
-    assert turn.output == "result: result: echo: from child"
+    assert turn.output is not None and turn.output.startswith('result: <task id="task_')
+    assert turn.output.endswith("<task_result>\nresult: echo: from child\n</task_result>\n</task>")
+    task_id = turn.output.split('"')[1]
+    meta, history = await runtime.task_archive().load(task_id)  # saved for a later `task_id` resume
+    assert meta is not None and meta.agent == "helper" and history
     children = [
         wf.id
         async for wf in executor.client.list_workflows("WorkflowType = 'ladderframe.Subagent'")

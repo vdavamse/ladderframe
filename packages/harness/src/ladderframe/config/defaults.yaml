@@ -13,23 +13,25 @@ tools: [Read, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch]
 
 tool_settings:
   Read:
-    max_lines: 2000
+    default_limit: 2000
     max_line_length: 2000
+    max_bytes: 51200
   Bash:
-    timeout: 120
-    max_timeout: 600
-    max_output_chars: 30000
+    timeout_ms: 120000
+    shell: bash
   Grep:
-    head_limit: 250
+    limit: 100
   Glob:
-    max_results: 1000
+    limit: 100
   WebFetch:
-    max_content_length: 50000
-    timeout: 30
     allow_local_urls: false
   WebSearch:
-    backend: duckduckgo
-    max_results: 8
+    provider: exa        # exa | parallel (hosted MCP endpoints, no key needed)
+
+# Tool results over either limit are cut; the full output is saved under var/lib/tool-output/.
+tool_output:
+  max_lines: 2000
+  max_bytes: 51200
 
 permissions:
   default: allow
@@ -39,6 +41,7 @@ permissions:
 limits:
   request_limit: 50
   max_subagent_depth: 2
+  tool_retries: 3
 
 share: true
 claude_compat: false

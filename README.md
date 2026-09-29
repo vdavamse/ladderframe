@@ -71,8 +71,9 @@ file `etc/ladderframe.<profile>.yaml` is merged on top (mappings merge, lists re
 model: sonnet                    # alias | claude-opus-5-5 | provider:model | {id, effort, settings}
 tools: [Read, Glob, Grep, Bash, Agent(code-reviewer, explore), Skill, WebFetch, WebSearch, Hello]
 tool_settings:
-  Bash: {timeout: 120}
-  WebSearch: {backend: tavily}   # duckduckgo (default, extra `search`) | tavily
+  Bash: {timeout_ms: 120000}
+  WebSearch: {provider: exa}     # exa (default) | parallel
+tool_output: {max_lines: 2000, max_bytes: 51200}
 permissions:
   default: allow                 # deny in production
   allow: [Bash(git *)]
@@ -92,6 +93,27 @@ MCP tool globs such as `github_*`. A matching deny rule wins, then an allow rule
 `allowed-tools` grant for the current run), then `default`. Denied calls are reported back to the
 model; fully blocked tools are hidden from it.
 
+## Built-in tools
+
+Claude Code names, opencode behaviour: parameters, prompts and output formats follow
+[opencode](https://github.com/sst/opencode)'s tools (`packages/opencode/src/tool/`). ripgrep is a
+prerequisite (the `ripgrep` wheel is a dependency; `ladderframe check` reports a missing `rg`).
+
+| Tool | Parameters | Output |
+|---|---|---|
+| `Read` | `filePath`, `offset`, `limit` | `<path>…</path><type>file</type><content>` with `N: line` rows and a `(End of file - total N lines)` / `Use offset=N to continue` footer; directories as `<entries>`; images and PDFs as attachments; nested `AGENTS.md` added as a `<system-reminder>` |
+| `Glob` | `pattern`, `path` | absolute paths from `rg --files` (first 100) |
+| `Grep` | `pattern`, `path`, `include` | `Found N matches`, grouped by file, `  Line N: text` (first 100) |
+| `Bash` | `command`, `timeout` (ms), `workdir` | stdout+stderr, tail kept when long; timeouts in `<shell_metadata>`; no exit code |
+| `WebFetch` | `url`, `format` (markdown/text/html), `timeout` (s) | the converted page; SSRF-safe, 5 MB cap |
+| `WebSearch` | `query`, `numResults`, `livecrawl`, `type`, `contextMaxCharacters` | text from Exa's (or Parallel's) hosted MCP search |
+| `Skill` | `name` | `<skill_content name=…>` with the body, base directory and sampled `<skill_files>` |
+| `Agent` (`Task`) | `description`, `prompt`, `subagent_type`, `task_id`, `command` | `<task id="…" state="completed"><task_result>…` — pass `task_id` back to continue that sub-agent |
+
+Results over `tool_output.max_lines` (2000) or `max_bytes` (50 KB) are cut and the full text is saved
+under `var/lib/tool-output/` (kept 7 days) with a hint to Read/Grep it or hand it to a sub-agent.
+Tool errors go back to the model; `limits.tool_retries` (3) consecutive failures of one tool end the run.
+
 ## Sub-agents — `agents/*.md`
 
 [Claude Code sub-agent format](https://code.claude.com/docs/en/sub-agents): the body is the system prompt.
@@ -109,8 +131,8 @@ model; fully blocked tools are hidden from it.
 
 ## Skills — `skills/<name>/SKILL.md`
 
-[Claude Code skill format](https://code.claude.com/docs/en/skills). Descriptions are listed to the model
-in the `Skill` tool; the body loads when the skill is invoked.
+[Claude Code skill format](https://code.claude.com/docs/en/skills). Descriptions are listed in the system
+prompt as `<available_skills>` (opencode's format); the body loads when the model calls `Skill(name)`.
 
 Supported: `name` (defaults to the directory), `description`, `when_to_use`, `arguments`,
 `argument-hint`, `disable-model-invocation`, `user-invocable`, `allowed-tools`, `disallowed-tools`,

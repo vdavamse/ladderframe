@@ -27,6 +27,12 @@ def check_runtime(runtime: Runtime) -> Report:
     for entry in main.unknown:
         report.errors.append(f"etc/ladderframe.yaml: unknown tool {entry!r}")
 
+    if {"Glob", "Grep", "Skill"} & set(main.functions):
+        from ..tools.ripgrep import rg_binary
+
+        if rg_binary() is None:
+            report.errors.append("ripgrep (rg) is required by Glob, Grep and Skill but was not found")
+
     subagents = runtime.subagents
     for name in main.allowed_subagents or []:
         if name not in subagents:

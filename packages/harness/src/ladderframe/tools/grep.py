@@ -1,153 +1,93 @@
+"""`Grep`: regex search over file contents via `rg --json`, grouped by file like opencode's grep tool."""
+
 from __future__ import annotations
 
-import asyncio
-import fnmatch
-import re
-import shutil
-from pathlib import Path
-from typing import Literal
+import json
+from dataclasses import dataclass
 
 from pydantic import BaseModel
 from pydantic_ai import ModelRetry, RunContext
 
 from ..core.deps import HarnessDeps
-from ..utils.text import truncate
 from .base import tool
+from .ripgrep import relative, run_rg
 
-OutputMode = Literal["content", "files_with_matches", "count"]
+DESCRIPTION = """- Fast content search tool that works with any codebase size
+- Searches file contents using regular expressions
+- Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
+- Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
+- Returns file paths and line numbers with matching lines
+- Use this tool when you need to find files containing specific patterns
+- If you need to identify/count the number of matches within files, use the Bash tool with `rg` (ripgrep) directly. Do NOT use `grep`.
+- When you are doing an open-ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead"""
+
+MAX_LINE_LENGTH = 2000
 
 
 class GrepSettings(BaseModel):
-    head_limit: int = 250
-    max_output_chars: int = 30_000
-    timeout: float = 60
+    limit: int = 100
 
 
-@tool(settings=GrepSettings, subject="path")
-async def Grep(
-    ctx: RunContext[HarnessDeps],
-    pattern: str,
-    path: str | None = None,
-    glob: str | None = None,
-    type: str | None = None,
-    output_mode: OutputMode = "files_with_matches",
-    case_insensitive: bool = False,
-    line_numbers: bool = True,
-    context: int | None = None,
-    multiline: bool = False,
-    head_limit: int | None = None,
-) -> str:
-    """Search file contents with a regular expression (ripgrep syntax).
+@dataclass
+class Match:
+    path: str
+    line: int
+    text: str
+
+
+@tool(settings=GrepSettings, subject="pattern", truncates=True, description=DESCRIPTION)
+async def Grep(ctx: RunContext[HarnessDeps], pattern: str, path: str | None = None, include: str | None = None) -> str:
+    """Search file contents with a regular expression.
 
     Args:
-        pattern: Regular expression to search for.
-        path: File or directory to search. Defaults to the working directory.
-        glob: Only search files matching this glob, e.g. `*.py` or `*.{ts,tsx}`.
-        type: Only search files of this ripgrep type, e.g. `py`, `js`, `rust`.
-        output_mode: `content` shows matching lines, `files_with_matches` lists files, `count` counts matches per file.
-        case_insensitive: Case-insensitive search.
-        line_numbers: Show line numbers in `content` mode.
-        context: Lines of context around each match in `content` mode.
-        multiline: Allow patterns to span lines.
-        head_limit: Maximum number of output lines.
+        pattern: The regex pattern to search for in file contents
+        path: The directory to search in. Defaults to the current working directory.
+        include: File pattern to include in the search (e.g. "*.js", "*.{ts,tsx}")
     """
-    settings = ctx.deps.settings("Grep", GrepSettings)
-    target = ctx.deps.resolve_path(path or ".")
-    if not target.exists():
-        raise ModelRetry(f"Path does not exist: {target}")
-    limit = head_limit or settings.head_limit
+    if not pattern:
+        raise ModelRetry("pattern is required")
+    limit = ctx.deps.settings("Grep", GrepSettings).limit
+    requested = ctx.deps.resolve_path(path) if path else ctx.deps.workdir_path
+    if not requested.exists():
+        raise ModelRetry(f"No such file or directory: {requested}")
+    cwd = requested if requested.is_dir() else requested.parent
 
-    if shutil.which("rg"):
-        output = await _ripgrep(
-            pattern, target, glob, type, output_mode, case_insensitive, line_numbers, context, multiline, settings
-        )
-    else:
-        output = _python_grep(pattern, target, glob, output_mode, case_insensitive, line_numbers, multiline)
+    args = ["--no-config", "--json", "--hidden", "--no-messages"]
+    if include:
+        args.append(f"--glob={include}")
+    args += ["--glob=!**/.git/**", "--", pattern, "." if requested.is_dir() else requested.name]
+    matches = (await run_rg(args, cwd, limit, _parse, pattern=pattern)).items
 
-    lines = output.splitlines()
-    if not lines:
-        return "No matches found"
-    result = "\n".join(lines[:limit])
-    if len(lines) > limit:
-        result += f"\n[{len(lines) - limit} more lines omitted; refine the pattern or raise head_limit.]"
-    return truncate(result, settings.max_output_chars)
-
-
-async def _ripgrep(
-    pattern: str,
-    target: Path,
-    glob: str | None,
-    type_: str | None,
-    mode: OutputMode,
-    case_insensitive: bool,
-    line_numbers: bool,
-    context: int | None,
-    multiline: bool,
-    settings: GrepSettings,
-) -> str:
-    args = ["rg", "--color=never", "--no-heading"]
-    if mode == "files_with_matches":
-        args.append("--files-with-matches")
-    elif mode == "count":
-        args.append("--count")
-    else:
-        if line_numbers:
-            args.append("--line-number")
-        if context:
-            args += ["--context", str(context)]
-    if case_insensitive:
-        args.append("--ignore-case")
-    if multiline:
-        args += ["--multiline", "--multiline-dotall"]
-    if glob:
-        args += ["--glob", glob]
-    if type_:
-        args += ["--type", type_]
-    args += ["--regexp", pattern, str(target)]
-    process = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), settings.timeout)
-    if process.returncode not in (0, 1):
-        raise ModelRetry(f"ripgrep failed: {stderr.decode(errors='replace').strip()}")
-    return stdout.decode(errors="replace")
+    if not matches:
+        return "No files found"
+    truncated = len(matches) == limit
+    output = [f"Found {len(matches)} matches{' (more matches available)' if truncated else ''}"]
+    current = ""
+    for match in matches:
+        file = str((cwd / match.path).resolve())
+        if file != current:
+            if current:
+                output.append("")
+            current = file
+            output.append(f"{file}:")
+        output.append(f"  Line {match.line}: {match.text}")
+    if truncated:
+        output += ["", "(Results truncated. Consider using a more specific path or pattern.)"]
+    return "\n".join(output)
 
 
-_SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
-
-
-def _python_grep(
-    pattern: str,
-    target: Path,
-    glob: str | None,
-    mode: OutputMode,
-    case_insensitive: bool,
-    line_numbers: bool,
-    multiline: bool,
-) -> str:
-    """Fallback when `rg` is not installed (the boot script installs it)."""
-    flags = (re.IGNORECASE if case_insensitive else 0) | (re.MULTILINE | re.DOTALL if multiline else 0)
+def _parse(line: str) -> Match | None:
     try:
-        regex = re.compile(pattern, flags)
-    except re.error as exc:
-        raise ModelRetry(f"Invalid regular expression: {exc}") from exc
-    files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
-    out: list[str] = []
-    for file in files:
-        if _SKIP_DIRS.intersection(file.parts) or (glob and not fnmatch.fnmatch(file.name, glob)):
-            continue
-        try:
-            text = file.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        if mode == "files_with_matches":
-            if regex.search(text):
-                out.append(str(file))
-        elif mode == "count":
-            if n := len(regex.findall(text)):
-                out.append(f"{file}:{n}")
-        else:
-            for number, line in enumerate(text.splitlines(), 1):
-                if regex.search(line):
-                    out.append(f"{file}:{number}:{line}" if line_numbers else f"{file}:{line}")
-    return "\n".join(out)
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if record.get("type") != "match":
+        return None
+    data = record["data"]
+    text = (data.get("lines") or {}).get("text") or ""
+    return Match(relative((data.get("path") or {}).get("text", "")), data.get("line_number") or 0, _clip(text))
+
+
+def _clip(text: str) -> str:
+    text = text.rstrip("\r\n")
+    return text[:MAX_LINE_LENGTH] + "..." if len(text) > MAX_LINE_LENGTH else text

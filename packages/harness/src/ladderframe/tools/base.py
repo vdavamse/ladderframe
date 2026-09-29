@@ -51,6 +51,8 @@ class ToolMeta:
 
     E.g. `command`, so that `Bash(git *)` matches on the command line.
     """
+    truncates: bool = False
+    """The tool bounds its own output; otherwise text results are truncated by the harness (see truncate.py)."""
     extra: dict[str, Any] = field(default_factory=dict)
     """Passed through to `pydantic_ai.Tool` (e.g. `timeout`, `sequential`, `requires_approval`)."""
 
@@ -66,6 +68,7 @@ def tool(
     aliases: tuple[str, ...] = (),
     prepare: ToolPrepareFunc[Any] | None = None,
     subject: Subject = None,
+    truncates: bool = False,
     **extra: Any,
 ) -> Callable[[F], F]: ...
 
@@ -80,12 +83,13 @@ def tool(
     aliases: tuple[str, ...] = (),
     prepare: ToolPrepareFunc[Any] | None = None,
     subject: Subject = None,
+    truncates: bool = False,
     **extra: Any,
 ) -> F | Callable[[F], F]:
     """Mark a function as a ladderframe tool. The tool name defaults to the function name."""
 
     def decorate(fn: F) -> F:
-        meta = ToolMeta(name or fn.__name__, description, settings, aliases, prepare, subject, extra)
+        meta = ToolMeta(name or fn.__name__, description, settings, aliases, prepare, subject, truncates, extra)
         setattr(fn, TOOL_ATTR, meta)
         return fn
 
