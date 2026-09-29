@@ -91,6 +91,11 @@ def cut(
             break
         line_size = len(line.encode("utf-8")) + (1 if out else 0)
         if size + line_size > max_bytes:
+            if not out:  # a single line over the limit (minified JSON, HTML): keep part of it
+                encoded = line.encode("utf-8")
+                part = encoded[:max_bytes] if direction == "head" else encoded[-max_bytes:]
+                out.append(part.decode("utf-8", errors="ignore"))
+                size = len(out[0].encode("utf-8"))
             hit_bytes = True
             break
         out.append(line)

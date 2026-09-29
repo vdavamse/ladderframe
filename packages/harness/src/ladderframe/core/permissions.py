@@ -2,7 +2,7 @@
 
     Bash                 every Bash call
     Bash(git *)          Bash calls whose command matches the glob
-    Read(/etc/**)        Read calls on matching paths
+    Read(/etc/**)        Read calls on matching absolute paths (as written, and with symlinks resolved)
     Agent(reviewer)      spawning the `reviewer` sub-agent (`Task(...)` is an alias)
     WebFetch(domain:example.com)
     github_*             every tool of the `github` MCP server

@@ -81,6 +81,14 @@ def test_rs256_via_jwks(jwks_server: tuple[str, rsa.RSAPrivateKey]) -> None:
     assert client.get("/me", headers={"Authorization": f"Bearer {forged}"}).status_code == 401
 
 
+def test_token_without_user_claim_is_rejected() -> None:
+    config = ServerConfig(auth="jwt", jwt=JWTConfig(secret="s" * 32, algorithms=["HS256"], user_claim="email"))
+    client = app_for(config)
+    no_email = jwt.encode({"sub": "svc", "exp": int(time.time()) + 60}, "s" * 32, algorithm="HS256")
+    response = client.get("/me", headers={"Authorization": f"Bearer {no_email}"})
+    assert response.status_code == 401 and "email" in response.json()["detail"]
+
+
 def test_jwt_config_needs_one_key_source() -> None:
     with pytest.raises(ValueError):
         Authenticator(ServerConfig(auth="jwt", jwt=JWTConfig()))

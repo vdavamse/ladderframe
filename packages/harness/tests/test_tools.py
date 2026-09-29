@@ -238,3 +238,132 @@ def test_render_task() -> None:
     assert render_task("task_1", "completed", "done") == (
         '<task id="task_1" state="completed">\n<task_result>\ndone\n</task_result>\n</task>'
     )
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_read_inside_a_temporal_activity(work: SimpleNamespace, tmp_path: Path) -> None:
+    from pydantic_ai.durable_exec.temporal import TemporalRunContext
+
+    from ladderframe.runtime.temporal.run_context import HarnessRunContext
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "AGENTS.md").write_text("Use tabs.")
+    (tmp_path / "pkg" / "f.py").write_text("x = 1\n")
+    # A plain TemporalRunContext has no `messages`: Read still works and includes the instructions.
+    plain = TemporalRunContext.deserialize_run_context({}, deps=work.deps)
+    assert "Use tabs." in str(Read(plain, "pkg/f.py"))  # type: ignore[arg-type]
+    # HarnessRunContext carries the files already included, so they aren't repeated.
+    loaded = [str(tmp_path / "pkg" / "AGENTS.md")]
+    carried = HarnessRunContext.deserialize_run_context({"loaded_instructions": loaded}, deps=work.deps)
+    assert "Use tabs." not in str(Read(carried, "pkg/f.py"))  # type: ignore[arg-type]
+
+
+def test_read_rules_match_the_resolved_path(runtime: Runtime, work: SimpleNamespace, tmp_path: Path) -> None:
+    from ladderframe.tools.base import get_meta, subject_of
+
+    meta = get_meta(Read)
+    runtime.config.permissions.deny = ["Read(/etc/**)"]
+    permissions = work.deps.permissions
+    depth = "../" * len(tmp_path.parts)
+    for spelling in ("/etc/passwd", "//etc/passwd", "/./etc/passwd", f"{depth}etc/passwd"):
+        assert not permissions.is_allowed("Read", subject_of(meta, {"filePath": spelling}, work.deps)), spelling
+    assert permissions.is_allowed("Read", subject_of(meta, {"filePath": "notes.txt"}, work.deps))
+
+
+def test_read_refuses_oversized_attachments(work: SimpleNamespace, tmp_path: Path) -> None:
+    from ladderframe.tools.read import MAX_ATTACHMENT_BYTES
+
+    (tmp_path / "big.png").write_bytes(PNG + b"\x00" * MAX_ATTACHMENT_BYTES)
+    with pytest.raises(ModelRetry, match="too large to attach"):
+        Read(work, "big.png")
+
+
+async def test_read_line_numbers_agree_with_grep(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "log.txt").write_bytes(b"progress 10%\rprogress 100%\nNEEDLE\n")
+    assert "Line 2: NEEDLE" in await Grep(work, "NEEDLE")
+    assert "2: NEEDLE" in str(Read(work, "log.txt"))
+
+
+async def test_glob_and_grep_at_exactly_the_limit_are_not_truncated(
+    runtime: Runtime, work: SimpleNamespace, tmp_path: Path
+) -> None:
+    runtime.config.tool_settings["Glob"] = {"limit": 2}
+    runtime.config.tool_settings["Grep"] = {"limit": 2}
+    (tmp_path / "a.py").write_text("hit\n")
+    (tmp_path / "b.py").write_text("hit\n")
+    assert "truncated" not in await Glob(work, "*.py")
+    out = await Grep(work, "hit")
+    assert "truncated" not in out and "more matches" not in out
+
+
+async def test_grep_decodes_non_utf8_lines(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "latin1.txt").write_bytes("caf\xe9 NEEDLE\n".encode("latin-1"))
+    assert "Line 1: caf� NEEDLE" in await Grep(work, "NEEDLE")
+
+
+async def test_grep_skips_lines_over_the_stream_limit(
+    work: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ladderframe.tools import ripgrep
+
+    monkeypatch.setattr(ripgrep, "STREAM_LIMIT", 64 * 1024)
+    (tmp_path / "big.json").write_text("NEEDLE" + "x" * 200_000)
+    (tmp_path / "small.txt").write_text("NEEDLE small\n")
+    out = await Grep(work, "NEEDLE")
+    assert "Line 1: NEEDLE small" in out and "big.json" not in out
+
+
+def test_truncation_keeps_part_of_a_single_long_line() -> None:
+    preview, removed, unit = truncate.cut("x" * 60_000, 2000, 51_200) or ("", 0, "")
+    assert preview == "x" * 51_200 and removed == 60_000 - 51_200 and unit == "bytes"
+    tail, _, _ = truncate.cut("a" * 10 + "b" * 100, 10, 50, direction="tail") or ("", 0, "")
+    assert tail == "b" * 50
+
+
+async def test_websearch_errors_do_not_leak_the_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx2
+
+    from ladderframe.tools import web_search
+
+    def refuse(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(429, request=request)
+
+    original = httpx2.AsyncClient
+
+    def client(**kwargs: object) -> httpx2.AsyncClient:
+        return original(transport=httpx2.MockTransport(refuse), **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(web_search.httpx2, "AsyncClient", client)
+    with pytest.raises(ModelRetry) as excinfo:
+        await web_search.call_mcp("https://mcp.exa.ai/mcp?exaApiKey=SECRET123", "web_search_exa", {}, 5)
+    assert "SECRET123" not in str(excinfo.value) and "429" in str(excinfo.value)
+
+
+async def test_webfetch_timeout_is_at_least_one_second(
+    runtime: Runtime, ctx: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ladderframe.tools import web_fetch
+
+    seen: list[int] = []
+
+    async def download(url: str, headers: dict[str, str], seconds: int, settings: object) -> object:
+        seen.append(seconds)
+        raise ModelRetry("stop")
+
+    monkeypatch.setattr(web_fetch, "_download", download)
+    for timeout in (0.5, -5, 500):
+        with pytest.raises(ModelRetry):
+            await WebFetch(ctx, "https://example.com", timeout=timeout)
+    assert seen == [1, 1, 120]
+
+
+def test_read_checks_the_symlink_target(runtime: Runtime, work: SimpleNamespace, tmp_path: Path) -> None:
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "key.txt").write_text("hunter2")
+    (tmp_path / "link.txt").symlink_to(secret / "key.txt")
+    runtime.config.permissions.deny = [f"Read({secret}/**)"]
+    out = str(Read(work, "link.txt"))
+    assert "Permission denied" in out and "hunter2" not in out

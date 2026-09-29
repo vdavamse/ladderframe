@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from .schema import HarnessConfig
 
@@ -73,16 +74,22 @@ def load_config(etc_dir: Path, profile: str | None = None, missing: set[str] | N
     base = etc_dir / "ladderframe.yaml"
     if base.exists():
         data = deep_merge(data, read_yaml(base))
+    sources = str(base)
     profile = profile or os.environ.get("LADDERFRAME_PROFILE")
     if profile:
         overlay = etc_dir / f"ladderframe.{profile}.yaml"
         if not overlay.exists():
             raise ConfigError(f"profile {profile!r} requested but {overlay} does not exist")
         data = deep_merge(data, read_yaml(overlay))
+        sources += f" + {overlay.name}"
     try:
         return HarnessConfig.model_validate(expand_env_vars(data, missing))
-    except ValueError as exc:
-        raise ConfigError(f"{base}: {exc}") from exc
+    except ValidationError as exc:
+        # Without the input values: `${VAR}` is already expanded, so they may be secrets.
+        problems = "; ".join(
+            f"{'.'.join(map(str, e['loc'])) or '(root)'}: {e['msg']}" for e in exc.errors(include_input=False)
+        )
+        raise ConfigError(f"{sources}: {problems}") from None
 
 
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdw]?)\s*$")

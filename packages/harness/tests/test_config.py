@@ -40,3 +40,26 @@ def test_profile_overlay() -> None:
 def test_missing_profile_is_an_error() -> None:
     with pytest.raises(ConfigError):
         load_config(ETC, profile="nope")
+
+
+def test_validation_errors_do_not_print_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LF_SECRET", "sk-live-123")
+    (tmp_path / "ladderframe.yaml").write_text("name: x\n")
+    (tmp_path / "ladderframe.bad.yaml").write_text("server:\n  api_keys: ${LF_SECRET}\n")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(tmp_path, profile="bad")
+    message = str(excinfo.value)
+    assert "sk-live-123" not in message and excinfo.value.__cause__ is None
+    assert "ladderframe.bad.yaml" in message and "server.api_keys" in message
+
+
+def test_check_refuses_web_protocol_with_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ladderframe import Runtime
+    from ladderframe.core.check import check_runtime
+
+    monkeypatch.chdir(ETC.parent)
+    runtime = Runtime.load(ETC.parent)
+    runtime.config.server.auth = "api-key"
+    runtime.config.server.api_keys = ["k"]
+    runtime.config.server.protocols = ["web"]
+    assert any("without authentication" in error for error in check_runtime(runtime).errors)

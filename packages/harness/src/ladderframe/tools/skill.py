@@ -3,6 +3,7 @@ available skills is in the system prompt (`<available_skills>`, see `Runtime.ski
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 from pydantic_ai import ModelRetry, RunContext
@@ -19,13 +20,20 @@ Use this tool to inject the skill's instructions and resources into current conv
 The skill name must match one of the skills listed in your system prompt."""
 
 SAMPLED_FILES = 10
+FORKED_SKILL_TIMEOUT = timedelta(minutes=30)
+"""Under Temporal, a `context: fork` skill runs its whole sub-agent loop inside this tool's activity."""
 
 
 async def _hide_without_skills(ctx: RunContext[HarnessDeps], tool_def: ToolDefinition) -> ToolDefinition | None:
     return tool_def if any(not s.disable_model_invocation for s in ctx.deps.runtime.skills.values()) else None
 
 
-@tool(subject="name", prepare=_hide_without_skills, description=DESCRIPTION)
+@tool(
+    subject="name",
+    prepare=_hide_without_skills,
+    description=DESCRIPTION,
+    metadata={"temporal": {"start_to_close_timeout": FORKED_SKILL_TIMEOUT}},
+)
 async def Skill(ctx: RunContext[HarnessDeps], name: str) -> str:
     """Load a skill.
 

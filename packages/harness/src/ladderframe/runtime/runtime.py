@@ -12,7 +12,7 @@ import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -231,9 +231,29 @@ class Runtime:
         capabilities: list[AbstractCapability[HarnessDeps]] = build_capabilities(self.config.capabilities)
         if self.durable:
             from pydantic_ai.durable_exec.temporal import TemporalDurability
+            from temporalio.common import RetryPolicy
 
-            # Only the main agent streams events: it runs in the session workflow, which hosts the stream.
-            capabilities.append(TemporalDurability(event_stream_topic=EVENT_TOPIC if main else None))
+            from ..tools.bash import BashSettings, max_timeout_ms
+            from .temporal.run_context import HarnessRunContext
+
+            bash = BashSettings.model_validate(self.config.tool_settings.get("Bash", {}))
+            capabilities.append(
+                TemporalDurability(
+                    # Only the main agent streams events: it runs in the session workflow, which hosts the stream.
+                    event_stream_topic=EVENT_TOPIC if main else None,
+                    run_context_type=HarnessRunContext,
+                    # Tool calls may not be idempotent (`git push`), so they are never retried, and they
+                    # get as long as the longest Bash command plus a margin.
+                    activity_config={
+                        "start_to_close_timeout": timedelta(milliseconds=max_timeout_ms(bash)) + timedelta(minutes=1),
+                        "retry_policy": RetryPolicy(maximum_attempts=1),
+                    },
+                    model_activity_config={
+                        "start_to_close_timeout": timedelta(minutes=5),
+                        "retry_policy": RetryPolicy(maximum_attempts=3),
+                    },
+                )
+            )
         return capabilities
 
     def _build(

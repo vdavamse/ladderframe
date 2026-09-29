@@ -89,11 +89,19 @@ _DRAIN_SECONDS = 2
 """After the shell exits, how long to keep reading output held open by background children."""
 
 
+DEFAULT_MAX_TIMEOUT_MS = 600_000
+
+
+def max_timeout_ms(settings: BashSettings) -> int:
+    return settings.max_timeout_ms or max(settings.timeout_ms, DEFAULT_MAX_TIMEOUT_MS)
+
+
 class BashSettings(BaseModel):
     timeout_ms: int = 120_000
     """Default timeout when the model does not pass one."""
     max_timeout_ms: int | None = None
-    """Upper bound for the model's `timeout`; none by default, as in opencode."""
+    """Upper bound for the model's `timeout`; 10 minutes (or `timeout_ms`, if larger) when unset. Under
+    Temporal, tool activities time out a minute after it (see `Runtime._capabilities`)."""
     shell: str = "bash"
     env: dict[str, str] = {}
     """Extra environment variables for every command."""
@@ -127,9 +135,7 @@ async def Bash(
     settings = ctx.deps.settings("Bash", BashSettings)
     if timeout is not None and timeout <= 0:
         raise ModelRetry(f"Invalid timeout value: {timeout}. Timeout must be a positive number.")
-    timeout_ms = timeout or settings.timeout_ms
-    if settings.max_timeout_ms:
-        timeout_ms = min(timeout_ms, settings.max_timeout_ms)
+    timeout_ms = min(timeout or settings.timeout_ms, max_timeout_ms(settings))
     cwd = ctx.deps.resolve_path(workdir) if workdir else ctx.deps.workdir_path
     if not cwd.is_dir():
         raise ModelRetry(f"workdir is not a directory: {cwd}")

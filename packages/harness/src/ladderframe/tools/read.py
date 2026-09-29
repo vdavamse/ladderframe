@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import BinaryContent, ToolReturn, ToolReturnPart
 
 from ..core.deps import HarnessDeps
+from ..core.permissions import PermissionDenied
 from .base import tool
 
 DESCRIPTION = """Read a file or directory from the local filesystem. If the path does not exist, an error is returned.
@@ -36,6 +39,8 @@ BINARY_EXTENSIONS = {
     ".pyc", ".pyo",
 }  # fmt: skip
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
+MAX_ATTACHMENT_BYTES = 3_750_000
+"""Largest image or PDF attached to a result: about 5 MB once base64-encoded, the providers' usual limit."""
 
 
 class ReadSettings(BaseModel):
@@ -45,7 +50,18 @@ class ReadSettings(BaseModel):
     """Stop reading once this many bytes of lines have been collected."""
 
 
-@tool(settings=ReadSettings, subject="filePath", truncates=True, description=DESCRIPTION)
+def _path_subject(args: dict[str, Any], deps: HarnessDeps) -> str | None:
+    """Rules match the absolute path with `..`, `.` and `//` removed, so `../../etc/x` can't slip past
+    `Read(/etc/**)`. This runs in workflow code under Temporal, so it must not touch the filesystem;
+    `Read` checks the symlink-resolved path again itself."""
+    path = args.get("filePath")
+    if path is None:
+        return None
+    joined = os.path.normpath(os.path.join(deps.workdir, os.path.expanduser(str(path))))
+    return "/" + joined.lstrip("/") if joined.startswith("//") else joined
+
+
+@tool(settings=ReadSettings, subject=_path_subject, truncates=True, description=DESCRIPTION)
 def Read(
     ctx: RunContext[HarnessDeps], filePath: str, offset: int | None = None, limit: int | None = None
 ) -> str | ToolReturn:
@@ -60,6 +76,10 @@ def Read(
     if (offset is not None and offset < 0) or (limit is not None and limit < 0):
         raise ModelRetry("offset and limit must be non-negative integers")
     path = ctx.deps.resolve_path(filePath)
+    try:  # a symlink can lead somewhere the rules deny
+        ctx.deps.permissions.check("Read", str(path))
+    except PermissionDenied as exc:
+        return str(exc)
     if not path.exists():
         raise ModelRetry(_not_found(path))
 
@@ -69,6 +89,8 @@ def Read(
     sample = _sample(path)
     mime = _sniff_mime(sample, path)
     if mime in IMAGE_MIMES or mime == "application/pdf":
+        if (size := path.stat().st_size) > MAX_ATTACHMENT_BYTES:
+            raise ModelRetry(f"{path} is too large to attach ({size} bytes, the limit is {MAX_ATTACHMENT_BYTES})")
         message = "PDF read successfully" if mime == "application/pdf" else "Image read successfully"
         return ToolReturn(message, content=[BinaryContent(data=path.read_bytes(), media_type=mime)])
     if _is_binary(path, sample):
@@ -166,8 +188,9 @@ def _read_lines(path: Path, start: int, limit: int, settings: ReadSettings) -> t
     size = 0
     count = 0
     more = False
-    with path.open(encoding="utf-8", errors="replace", newline="") as handle:
-        for raw in handle:
+    with path.open("rb") as handle:
+        for raw_bytes in handle:  # splits on \n only, like ripgrep, so line numbers agree with Grep's
+            raw = raw_bytes.decode("utf-8", errors="replace")
             count += 1
             if count < start:
                 continue
@@ -191,7 +214,7 @@ def _nearby_instructions(ctx: RunContext[HarnessDeps], path: Path) -> list[str]:
     current = path.resolve().parent
     if root not in current.parents:
         return []
-    seen = _already_loaded(getattr(ctx, "messages", None) or [])
+    seen = _loaded_instructions(ctx)
     found: list[str] = []
     while current != root and root in current.parents:
         for name in INSTRUCTION_FILES:
@@ -206,7 +229,20 @@ def _nearby_instructions(ctx: RunContext[HarnessDeps], path: Path) -> list[str]:
     return found
 
 
-def _already_loaded(messages: list[Any]) -> set[str]:
+def _loaded_instructions(ctx: RunContext[HarnessDeps]) -> set[str]:
+    # Under Temporal, Read runs in an activity, where `ctx.messages` isn't available; the workflow side
+    # sends the list instead (see runtime/temporal/run_context.py).
+    carried = vars(ctx).get("loaded_instructions")
+    if carried is not None:
+        return set(carried)
+    try:
+        return already_loaded(ctx.messages)
+    except (AttributeError, UserError):
+        return set()
+
+
+def already_loaded(messages: list[Any]) -> set[str]:
+    """Instruction files that earlier Read results in the conversation already included."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):

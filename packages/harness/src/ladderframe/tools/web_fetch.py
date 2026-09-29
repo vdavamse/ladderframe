@@ -16,6 +16,7 @@ from pydantic_ai.messages import BinaryContent, ToolReturn
 
 from ..core.deps import HarnessDeps
 from .base import tool
+from .read import MAX_ATTACHMENT_BYTES
 
 DESCRIPTION = """- Fetches content from a specified URL
 - Takes a URL and optional format as input
@@ -76,7 +77,7 @@ async def WebFetch(
     if not url.startswith(("http://", "https://")):
         raise ModelRetry("URL must start with http:// or https://")
     settings = ctx.deps.settings("WebFetch", WebFetchSettings)
-    seconds = int(min(timeout or DEFAULT_TIMEOUT, MAX_TIMEOUT))
+    seconds = max(1, min(int(timeout or DEFAULT_TIMEOUT), MAX_TIMEOUT))
     headers = {"User-Agent": USER_AGENT, "Accept": ACCEPT[format], "Accept-Language": "en-US,en;q=0.9"}
     headers.update(settings.headers or {})
 
@@ -92,6 +93,8 @@ async def WebFetch(
     content_type = response.headers.get("content-type", "")
     mime = content_type.split(";")[0].strip().lower()
     if mime in IMAGE_MIMES:
+        if len(response.content) > MAX_ATTACHMENT_BYTES:
+            raise ModelRetry(f"Image is too large to attach ({len(response.content)} bytes)")
         return ToolReturn("Image fetched successfully", content=[BinaryContent(data=response.content, media_type=mime)])
 
     content = response.content.decode("utf-8", errors="replace")

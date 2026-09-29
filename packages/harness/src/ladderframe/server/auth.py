@@ -87,7 +87,9 @@ class _JWTVerifier:
         except self._jwt.PyJWTError as exc:
             raise _unauthorized(f"invalid token: {exc}") from exc
         user = claims.get(config.user_claim)
-        return Principal(str(user) if user is not None else None, claims)
+        if user is None or user == "":  # a user-less token would see every user's sessions
+            raise _unauthorized(f"token has no {config.user_claim!r} claim")
+        return Principal(str(user), claims)
 
 
 def _unauthorized(detail: str) -> HTTPException:

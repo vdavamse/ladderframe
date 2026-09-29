@@ -98,6 +98,15 @@ class ServerConfig(_Model):
     api_keys: list[str] = Field(default_factory=list)
     jwt: JWTConfig = Field(default_factory=JWTConfig)
 
+    def web_protocol_error(self) -> str | None:
+        """`protocols: [web]` mounts pydantic-ai's chat UI outside authentication, so it needs `auth: none`."""
+        if "web" in self.protocols and self.auth != "none":
+            return (
+                "server.protocols includes web, which runs the agent without authentication; "
+                f"remove it when server.auth is {self.auth}"
+            )
+        return None
+
 
 class ObservabilityConfig(_Model):
     tracing: Literal["none", "otel", "logfire"] = "none"

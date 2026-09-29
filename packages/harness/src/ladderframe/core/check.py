@@ -76,6 +76,8 @@ def check_runtime(runtime: Runtime) -> Report:
             import temporalio  # noqa: F401
         except ImportError:
             report.errors.append("runtime.executor is temporal but `ladderframe[temporal]` is not installed")
+    if error := config.server.web_protocol_error():
+        report.errors.append(error)
     if config.server.auth == "api-key" and not any(config.server.api_keys):
         report.errors.append("server.auth is api-key but server.api_keys is empty")
     if config.server.auth == "jwt":

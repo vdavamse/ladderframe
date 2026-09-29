@@ -9,19 +9,22 @@ from datetime import timedelta
 from pydantic_ai.durable_exec.temporal import stream_agent_events
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.run import AgentRunResultEvent
-from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
+from temporalio.client import Client, WithStartWorkflowOperation, WorkflowQueryFailedError, WorkflowUpdateFailedError
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.service import RPCError, RPCStatusCode
 
 from ...config.loader import parse_duration
 from ...storage.sessions import SessionArchive, SessionMeta, validate_session_id
-from ..executor import Executor, NativeEvent, TurnFailed, TurnState, new_id
+from ..executor import Executor, NativeEvent, NotOwner, TurnFailed, TurnState, new_id
 from ..runtime import EVENT_TOPIC, Runtime
 from .client import connect, task_queue
 from .session_workflow import SessionInput, SessionWorkflow, SubmitRequest, session_workflow_id
 
 _STATUS_POLL = 1.0
+_ROLLOVER_WAIT = 120.0
+"""How long `wait` keeps retrying while a run continues as new (its stream drains for up to 30 s)."""
+_CARRIED_OVER = {"TurnCarriedOver", "AcceptedUpdateCompletedWorkflow"}
 
 
 class TemporalExecutor(Executor):
@@ -47,7 +50,7 @@ class TemporalExecutor(Executor):
         return self.client.get_workflow_handle_for(SessionWorkflow.run, self._workflow_id(session_id))
 
     async def submit(self, session_id: str, prompt: str, *, user: str | None = None) -> TurnState:
-        request = SubmitRequest(turn_id=new_id(), prompt=prompt)
+        request = SubmitRequest(turn_id=new_id(), prompt=prompt, user=user)
         temporal = self.runtime.config.runtime.temporal
         for attempt in range(3):
             start = WithStartWorkflowOperation(
@@ -68,6 +71,8 @@ class TemporalExecutor(Executor):
                     SessionWorkflow.submit, request, start_workflow_operation=start
                 )
             except WorkflowUpdateFailedError as exc:
+                if _cause_type(exc) == "NotOwner":
+                    raise NotOwner(session_id) from exc
                 if not _is_closing(exc) or attempt == 2:
                     raise
                 # The session went idle and is finishing; wait for it, then start a fresh run.
@@ -75,7 +80,15 @@ class TemporalExecutor(Executor):
         raise AssertionError("unreachable")
 
     async def wait(self, session_id: str, turn_id: str) -> TurnState:
-        return await self._handle(session_id).execute_update(SessionWorkflow.wait, turn_id)
+        deadline = asyncio.get_running_loop().time() + _ROLLOVER_WAIT
+        while True:
+            try:
+                return await self._handle(session_id).execute_update(SessionWorkflow.wait, turn_id)
+            except WorkflowUpdateFailedError as exc:
+                # The run is continuing as new before the turn ran; the next run carries it over.
+                if _cause_type(exc) not in _CARRIED_OVER or asyncio.get_running_loop().time() > deadline:
+                    raise
+                await asyncio.sleep(_STATUS_POLL / 4)
 
     async def turn(self, session_id: str, turn_id: str) -> TurnState:
         state = await self._handle(session_id).query(SessionWorkflow.turn, turn_id)
@@ -89,6 +102,8 @@ class TemporalExecutor(Executor):
         while state.status == "queued":
             await asyncio.sleep(_STATUS_POLL / 4)
             state = await self.turn(session_id, turn_id)
+        if state.events_expired:
+            raise TurnFailed("the turn's events have expired; read its result with wait()")
         if state.status == "failed" or state.offset is None:
             raise TurnFailed(state.error or "turn failed")
 
@@ -130,12 +145,29 @@ class TemporalExecutor(Executor):
     async def sessions(self, user: str | None = None) -> list[SessionMeta]:
         return await self.archive.list(user)
 
+    async def owner(self, session_id: str) -> str | None:
+        meta = await self.archive.load_meta(session_id)
+        if meta is not None:
+            return meta.user
+        try:  # started, but no snapshot yet
+            return await self._handle(session_id).query(SessionWorkflow.owner)
+        except WorkflowQueryFailedError:
+            return None  # not answerable yet; submits are still checked by the workflow itself
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                raise
+            return None
+
     async def close_session(self, session_id: str) -> None:
         try:
             await self._handle(session_id).signal(SessionWorkflow.close)
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
+
+
+def _cause_type(exc: WorkflowUpdateFailedError) -> str | None:
+    return getattr(exc.cause, "type", None)
 
 
 def _is_closing(exc: WorkflowUpdateFailedError) -> bool:

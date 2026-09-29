@@ -21,6 +21,9 @@ from pydantic_ai import ModelRetry
 
 T = TypeVar("T")
 
+STREAM_LIMIT = 16 * 1024 * 1024
+"""Longest rg output line read; longer ones (`rg --json` always prints the whole matched line) are skipped."""
+
 _INVALID_PATTERN = ("regex parse error", "error parsing glob", "unclosed character class", "invalid")
 
 
@@ -60,13 +63,22 @@ async def run_rg(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024,
+        limit=STREAM_LIMIT,
     )
     assert process.stdout is not None and process.stderr is not None
     items: list[T] = []
     truncated = False
     try:
-        async for raw in process.stdout:
+        while True:
+            try:
+                raw = await process.stdout.readuntil(b"\n")
+            except asyncio.LimitOverrunError as exc:
+                await _skip_record(process.stdout, exc.consumed)  # e.g. a match in a huge minified file
+                continue
+            except asyncio.IncompleteReadError as exc:
+                raw = exc.partial
+                if not raw:
+                    break
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
                 continue
@@ -77,19 +89,33 @@ async def run_rg(
                 truncated = True
                 break
             items.append(item)
+        if truncated:
+            return RgResult(items, True)
+        stderr = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
+        code = await process.wait()
     finally:
-        if truncated and process.returncode is None:
+        if process.returncode is None:  # truncated, failed or cancelled: don't leave rg running
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
-    stderr = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
-    code = await process.wait()
-    if truncated:
-        return RgResult(items, True)
+            await process.wait()
     if pattern is not None and code == 2 and any(marker in stderr.lower() for marker in _INVALID_PATTERN):
         raise ModelRetry(stderr)
     if code not in (0, 1, 2):
         raise ModelRetry(stderr or f"ripgrep failed with code {code}")
     return RgResult([] if code == 1 else items, False)
+
+
+async def _skip_record(stream: asyncio.StreamReader, consumed: int) -> None:
+    """Drop an output line longer than the stream limit, up to and including its newline."""
+    await stream.readexactly(consumed)
+    while True:
+        try:
+            await stream.readuntil(b"\n")
+            return
+        except asyncio.LimitOverrunError as exc:
+            await stream.readexactly(exc.consumed)
+        except asyncio.IncompleteReadError:
+            return
 
 
 def relative(line: str) -> str:

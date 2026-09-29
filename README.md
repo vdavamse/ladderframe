@@ -93,6 +93,11 @@ MCP tool globs such as `github_*`. A matching deny rule wins, then an allow rule
 `allowed-tools` grant for the current run), then `default`. Denied calls are reported back to the
 model; fully blocked tools are hidden from it.
 
+`Read(...)` rules match the absolute path after `..`, `//` and symlinks are resolved. `Bash(...)` rules
+match the whole command line, and `*` also matches `;`, `&&`, `|` and `$(…)`, so `Bash(git *)` allows
+`git status && curl …`. Don't rely on Bash rules to contain a command; a stricter Bash security model is
+planned.
+
 ## Built-in tools
 
 Claude Code names, opencode behaviour: parameters, prompts and output formats follow
@@ -101,10 +106,10 @@ prerequisite (the `ripgrep` wheel is a dependency; `ladderframe check` reports a
 
 | Tool | Parameters | Output |
 |---|---|---|
-| `Read` | `filePath`, `offset`, `limit` | `<path>…</path><type>file</type><content>` with `N: line` rows and a `(End of file - total N lines)` / `Use offset=N to continue` footer; directories as `<entries>`; images and PDFs as attachments; nested `AGENTS.md` added as a `<system-reminder>` |
+| `Read` | `filePath`, `offset`, `limit` | `<path>…</path><type>file</type><content>` with `N: line` rows and a `(End of file - total N lines)` / `Use offset=N to continue` footer; directories as `<entries>`; images and PDFs up to 3.75 MB (5 MB base64) as attachments; nested `AGENTS.md` added as a `<system-reminder>` |
 | `Glob` | `pattern`, `path` | absolute paths from `rg --files` (first 100) |
 | `Grep` | `pattern`, `path`, `include` | `Found N matches`, grouped by file, `  Line N: text` (first 100) |
-| `Bash` | `command`, `timeout` (ms), `workdir` | stdout+stderr, tail kept when long; timeouts in `<shell_metadata>`; no exit code |
+| `Bash` | `command`, `timeout` (ms, capped by `max_timeout_ms`, default 10 min), `workdir` | stdout+stderr, tail kept when long; timeouts in `<shell_metadata>`; no exit code |
 | `WebFetch` | `url`, `format` (markdown/text/html), `timeout` (s) | the converted page; SSRF-safe, 5 MB cap |
 | `WebSearch` | `query`, `numResults`, `livecrawl`, `type`, `contextMaxCharacters` | text from Exa's (or Parallel's) hosted MCP search |
 | `Skill` | `name` | `<skill_content name=…>` with the body, base directory and sampled `<skill_files>` |
@@ -140,6 +145,11 @@ Supported: `name` (defaults to the directory), `description`, `when_to_use`, `ar
 `${CLAUDE_SKILL_DIR}`, `${CLAUDE_PROJECT_DIR}`, `${CLAUDE_SESSION_ID}`, `${AGENT_ROOT}`; shell
 injection `` !`cmd` `` and ```` ```! ```` blocks (checked against `Bash` permission rules; disable with
 `disable_skill_shell_execution: true`).
+
+Arguments are substituted before the shell blocks run, so argument text is treated as part of the
+skill. Only the person at the `repl` passes arguments (`/fix-issue 42`); the model's `Skill` tool takes
+just a name. To screen tool results (web pages, files) that could steer the model, enable the
+`prompt_injection_defender` capability, as the `coder` agent's `prod` profile does.
 
 ## MCP servers — `mcp.yaml`
 
@@ -200,10 +210,13 @@ with `tool_packages: [my-package]`. Capabilities use the `ladderframe.capabiliti
 | `DELETE /v1/sessions/{id}` | close the session |
 | `POST /chat` | Vercel AI SDK data stream (`useChat({api: "/chat"})`); the chat `id` is the session id |
 | `POST /ag-ui` | AG-UI; the thread id is the session id |
-| `GET /` | pydantic-ai chat UI — development only: it runs the agent directly, not through the executor |
+| `GET /` | pydantic-ai chat UI — development only: it runs the agent directly, not through the executor, and has no authentication, so `serve` refuses it unless `server.auth` is `none` |
 
 `server.protocols` selects `vercel-ai`, `ag-ui` and `web`. The UI protocols send the whole conversation, but
 only the latest user message is submitted: the session keeps its own history.
+
+A session belongs to the user who sent its first message: for anyone else, every `/v1/sessions/{id}/…`
+route and the UI protocols answer `404`. A JWT without the `user_claim` claim is rejected.
 
 **Authentication** (`server.auth`, `/health`, `/ready` and `/metrics` stay open):
 
@@ -255,14 +268,20 @@ assertion evaluators (`Contains`, `LLMJudge`, `MaxDuration`, ...) pass.
 
 - **One agent per pod.** `ladderframe serve` runs the HTTP API and the Temporal worker for task queue
   `ladderframe-<agent>` in one process; supercronic runs alongside (`deploy/entrypoint.sh`). Cron jobs call
-  `ladderframe run`, which goes through the same executor, so scheduled runs are durable too.
+  `ladderframe run`, which goes through the same executor, so scheduled runs are durable too. `tini` is
+  PID 1; if the server or supercronic exits, the entrypoint stops the other and the container exits, so
+  the pod restarts instead of silently losing cron. SIGTERM reaches both, so running jobs can finish.
+- **Working directory:** the image runs in `/srv/workspace`, owned by the agent user (uid 10001).
 - **Sessions are Temporal entity workflows** (`session:<agent>:<id>`): update `submit` queues a turn, update
   `wait` returns its result, query `turn` reports status, signal `close` ends it. Each turn runs the main agent
   with pydantic-ai's `TemporalDurability`, so model requests and tool calls are activities.
 - **Events** go through the session's Temporal Workflow Stream (`AgentEventStream`), read with
-  `stream_agent_events`; each turn truncates the previous turn's events so workflow state stays small.
+  `stream_agent_events`. The stream keeps the last 5 turns' events so workflow state stays small; reading
+  the events of an older turn fails with "events have expired" (its result is still available from `wait`).
+- **Activities:** tool calls are never retried (they may not be idempotent) and time out a minute after
+  Bash's `max_timeout_ms`; model requests time out after 5 minutes and are tried 3 times.
 - **Sub-agents** started by the `Agent` tool run as child workflows (`ladderframe.Subagent`). Forked skills
-  (`context: fork`) run inside the Skill tool's activity and are not durable step by step.
+  (`context: fork`) run inside the Skill tool's activity (30-minute timeout) and are not durable step by step.
 - **Object storage** (one bucket): `sessions/<agent>/<id>/` gets a history snapshot after every turn
   (kept), and Temporal payloads over `storage.payload_threshold_bytes` (256 KiB) go to `payloads/` through
   Temporal External Storage. Continue-as-new carries only the snapshot key. Idle sessions complete after
@@ -271,6 +290,10 @@ assertion evaluators (`Contains`, `LLMJudge`, `MaxDuration`, ...) pass.
   the namespace retention (30 days in the compose file), or old workflows can no longer replay.
 - **MinIO images:** MinIO no longer publishes free container images; set `MINIO_IMAGE` / `MINIO_MC_IMAGE`
   for `deploy/docker-compose.yaml` to a build or registry you have access to.
+- **Compose:** `deploy/docker-compose.yaml` needs `LADDERFRAME_API_KEY` and publishes its ports on
+  `127.0.0.1` only (Temporal has no authentication, and its workflow histories contain user prompts).
+- **System tools:** `etc/init.d/01_boot.sh` installs jq, rg and gh from apt, and checks every binary it
+  downloads (supercronic, mq, and fallbacks on hosts without apt) against a pinned or published SHA-256.
 - **Kubernetes:** `deploy/helm/ladderframe` deploys one agent per release: a single replica with the
   `Recreate` strategy (cron jobs never run twice during a rollout), `/health` and `/ready` probes, secrets
   from `existingSecret`, an optional PVC for `var/`, and an optional Prometheus Operator `ServiceMonitor`.

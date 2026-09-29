@@ -24,19 +24,23 @@ the working directory and the runtime. Settings come from `tool_settings.<Name>`
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pydantic import BaseModel
 from pydantic_ai import Tool
 from pydantic_ai.tools import ToolPrepareFunc
 
+if TYPE_CHECKING:
+    from ..core.deps import HarnessDeps
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 TOOL_ATTR = "__ladderframe_tool__"
 
-Subject = str | Callable[[dict[str, Any]], str | None] | None
+Subject = str | Callable[[dict[str, Any]], str | None] | Callable[[dict[str, Any], "HarnessDeps"], str | None] | None
 
 
 @dataclass
@@ -49,7 +53,8 @@ class ToolMeta:
     subject: Subject = None
     """Argument name (or function of the arguments) checked against permission specifiers.
 
-    E.g. `command`, so that `Bash(git *)` matches on the command line.
+    E.g. `command`, so that `Bash(git *)` matches on the command line. A function may also take the
+    deps as a second argument, e.g. to normalize a path before it is matched.
     """
     truncates: bool = False
     """The tool bounds its own output; otherwise text results are truncated by the harness (see truncate.py)."""
@@ -100,11 +105,13 @@ def get_meta(obj: Any) -> ToolMeta | None:
     return getattr(obj, TOOL_ATTR, None)
 
 
-def subject_of(meta: ToolMeta | None, args: dict[str, Any]) -> str | None:
+def subject_of(meta: ToolMeta | None, args: dict[str, Any], deps: HarnessDeps) -> str | None:
     if meta is None or meta.subject is None:
         return None
     if callable(meta.subject):
-        return meta.subject(args)
+        if len(inspect.signature(meta.subject).parameters) >= 2:
+            return meta.subject(args, deps)  # type: ignore[call-arg]
+        return meta.subject(args)  # type: ignore[call-arg]
     value = args.get(meta.subject)
     return None if value is None else str(value)
 

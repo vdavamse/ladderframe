@@ -1,6 +1,7 @@
 # Local/staging stack: self-hosted Temporal (+ its own Postgres and UI), MinIO, and one agent pod.
 #   docker compose -f deploy/docker-compose.yaml up --build
 # Pin image versions before using this beyond development.
+# Needs LADDERFRAME_API_KEY (the agent's API key); ports are published on 127.0.0.1 only.
 
 services:
   temporal-postgres:
@@ -26,14 +27,14 @@ services:
       POSTGRES_SEEDS: temporal-postgres
       DEFAULT_NAMESPACE: ladderframe
       DEFAULT_NAMESPACE_RETENTION: 30d
-    ports: ["7233:7233"]
+    ports: ["127.0.0.1:7233:7233"]   # no auth: workflow histories contain user prompts
 
   temporal-ui:
     image: temporalio/ui:latest
     depends_on: [temporal]
     environment:
       TEMPORAL_ADDRESS: temporal:7233
-    ports: ["8233:8080"]
+    ports: ["127.0.0.1:8233:8080"]
 
   minio:
     image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}   # MinIO no longer publishes free images; point this at your build/registry
@@ -42,7 +43,7 @@ services:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY:-ladderframe}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-ladderframe-secret}
     volumes: [minio-data:/data]
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -80,8 +81,8 @@ services:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-ladderframe}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-ladderframe-secret}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      LADDERFRAME_API_KEY: ${LADDERFRAME_API_KEY:-change-me}
-    ports: ["8080:8080"]
+      LADDERFRAME_API_KEY: ${LADDERFRAME_API_KEY:?set LADDERFRAME_API_KEY}
+    ports: ["127.0.0.1:8080:8080"]
 
 volumes:
   temporal-db:

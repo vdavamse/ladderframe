@@ -37,12 +37,13 @@ async def Glob(ctx: RunContext[HarnessDeps], pattern: str, path: str | None = No
         raise ModelRetry(f"No such directory: {search}")
 
     args = ["--no-config", "--files", f"--glob={pattern}", "--glob=!**/.git/**", "."]
-    files = (await run_rg(args, search, limit, relative, pattern=pattern)).items
+    result = await run_rg(args, search, limit, relative, pattern=pattern)
+    files = result.items
 
     if not files:
         return "No files found"
     output = [str((search / f).resolve()) for f in files]
-    if len(files) == limit:
+    if result.truncated:
         output += [
             "",
             f"(Results are truncated: showing first {limit} results. Consider using a more specific path or pattern.)",

@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from pydantic_ai.usage import RunUsage
+
     from ...core.deps import HarnessDeps
     from ...storage.sessions import count_user_turns
     from ..registry import get_runtime
-    from .activities import LoadSessionInput, SaveSessionInput, load_session, save_session
+    from .activities import LoadedSession, LoadSessionInput, SaveSessionInput, load_session, save_session
     from .session_workflow import _ACTIVITY
 
 
@@ -34,14 +36,14 @@ class SubagentWorkflow:
         runtime = get_runtime(params.root_path)
         spec = runtime.subagents[params.subagent]
         agent, _ = runtime.subagent(spec)
-        history = []
+        loaded = LoadedSession([])
         if params.resume:
-            history = await workflow.execute_activity(
+            loaded = await workflow.execute_activity(
                 load_session, LoadSessionInput(params.root_path, params.task_id, tasks=True), **_ACTIVITY
             )
         result = await agent.run(
             params.prompt,
-            message_history=history,
+            message_history=loaded.messages,
             deps=params.deps,
             usage_limits=runtime.usage_limits(spec.max_turns),
         )
@@ -55,7 +57,7 @@ class SubagentWorkflow:
                     title=params.description,
                     turns=count_user_turns(result.all_messages()),
                     status="closed",
-                    usage=result.usage,
+                    usage=(loaded.meta.usage if loaded.meta else RunUsage()) + result.usage,
                     tasks=True,
                     agent=params.subagent,
                 ),

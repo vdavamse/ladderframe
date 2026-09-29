@@ -32,7 +32,7 @@ class PermissionGuard(WrapperToolset[HarnessDeps]):
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[HarnessDeps], tool: ToolsetTool[HarnessDeps]
     ) -> Any:
         meta = get_meta(self.functions.get(name))
-        subject = subject_of(meta, tool_args)
+        subject = subject_of(meta, tool_args, ctx.deps)
         try:
             ctx.deps.permissions.check(name, subject)
         except PermissionDenied as exc:

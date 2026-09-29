@@ -20,6 +20,7 @@ from pydantic_ai.run import AgentRunResultEvent
 from temporalio.testing import WorkflowEnvironment
 
 from ladderframe import Runtime
+from ladderframe.runtime.executor import TurnFailed
 from ladderframe.runtime.temporal.client import task_queue
 from ladderframe.runtime.temporal.executor import TemporalExecutor
 from ladderframe.runtime.temporal.worker import build_worker
@@ -42,6 +43,8 @@ def model() -> FunctionModel:
         prompt = str(last.parts[-1].content)
         if prompt.startswith("echo:"):
             return ModelResponse(parts=[ToolCallPart("Echo", {"text": prompt[5:]})])
+        if prompt.startswith("read:"):
+            return ModelResponse(parts=[ToolCallPart("Read", {"filePath": prompt[5:]})])
         if prompt.startswith("delegate:"):
             args = {"description": "echo", "prompt": "echo:" + prompt[9:], "subagent_type": "helper"}
             return ModelResponse(parts=[ToolCallPart("Agent", args)])
@@ -83,7 +86,7 @@ async def test_turns_share_history_and_are_archived(env: tuple[Runtime, Temporal
     first = await executor.send("s1", "hello", user="ada")
     assert first.status == "done", first.error
     assert first.output == "seen 1 messages"
-    second = await executor.send("s1", "again")
+    second = await executor.send("s1", "again", user="ada")
     assert second.output == "seen 3 messages"  # request, response, request
     history = await executor.history("s1")
     assert len(history) == 4
@@ -135,6 +138,8 @@ async def test_closed_session_resumes_from_snapshot(env: tuple[Runtime, Temporal
     assert meta.status == "closed"
     resumed = await executor.send("s5", "two")
     assert resumed.output == "seen 3 messages"  # history came back from object storage
+    [meta] = [m for m in await executor.sessions() if m.session_id == "s5"]
+    assert meta.turns == 2 and meta.usage.requests == 2  # counted on from the stored totals
 
 
 async def test_task_queue_name_and_offloaded_payloads(env: tuple[Runtime, TemporalExecutor]) -> None:
@@ -177,3 +182,73 @@ async def test_http_api_over_temporal(env: tuple[Runtime, TemporalExecutor]) -> 
             json.loads(line[6:]).get("delta", "") for line in response.text.splitlines() if line.startswith("data: {")
         )
         assert text == "seen 1 messages"
+
+
+async def test_read_in_a_subdirectory_under_temporal(env: tuple[Runtime, TemporalExecutor], tmp_path: Path) -> None:
+    runtime, executor = env
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "AGENTS.md").write_text("Use tabs.")
+    (tmp_path / "pkg" / "f.py").write_text("x = 1\n")
+    workdir, runtime.workdir = runtime.workdir, tmp_path
+    try:
+        first = await executor.send("s-read", "read:pkg/f.py")
+        assert first.status == "done", first.error
+        assert first.output is not None and "1: x = 1" in first.output and "Use tabs." in first.output
+        second = await executor.send("s-read", "read:pkg/f.py")
+        assert second.output is not None and "1: x = 1" in second.output and "Use tabs." not in second.output
+    finally:
+        runtime.workdir = workdir
+
+
+async def test_events_of_an_earlier_turn_stay_its_own(env: tuple[Runtime, TemporalExecutor]) -> None:
+    _, executor = env
+    first = await executor.submit("s-ev", "one")
+    second = await executor.submit("s-ev", "two")
+    await executor.wait("s-ev", second.turn_id)
+    events = [event async for event in executor.events("s-ev", first.turn_id)]
+    assert events[-1].result.output == "seen 1 messages"  # type: ignore[union-attr]
+    for index in range(5):  # push the first turn's events out of the stream log
+        await executor.send("s-ev", f"more {index}")
+    with pytest.raises(TurnFailed, match="expired"):
+        [event async for event in executor.events("s-ev", first.turn_id)]
+
+
+async def test_submit_to_another_users_session_is_refused(env: tuple[Runtime, TemporalExecutor]) -> None:
+    from ladderframe.runtime.executor import NotOwner
+
+    _, executor = env
+    assert (await executor.send("s-own", "hi", user="ada")).status == "done"
+    with pytest.raises(NotOwner):
+        await executor.submit("s-own", "hi", user="eve")
+    assert await executor.owner("s-own") == "ada"
+
+
+async def test_turns_submitted_during_rollover_all_run(
+    env: tuple[Runtime, TemporalExecutor], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from ladderframe.runtime.temporal import session_workflow
+
+    _, executor = env
+    monkeypatch.setattr(session_workflow, "_continue_as_new_suggested", lambda: True)  # after every turn
+    first = await executor.send("s-roll", "one", user="ada")
+    assert first.output == "seen 1 messages"
+    # The run is now draining its stream (up to 30 s, nobody reads it) before continuing as new, and
+    # still accepts submits: their `wait`s must not keep the drain from finishing.
+    await asyncio.sleep(2)
+    turns = await asyncio.wait_for(
+        asyncio.gather(*(executor.send("s-roll", f"turn {i}", user="ada") for i in range(4))), timeout=240
+    )
+    assert all(t.status == "done" for t in turns), [t.error for t in turns]
+    assert sorted(t.output or "" for t in turns) == [f"seen {n} messages" for n in (3, 5, 7, 9)]
+    assert len(await executor.history("s-roll")) == 10
+    for _ in range(120):  # it really continued as new (after draining the stream for up to 30 s)
+        info = (await executor._handle("s-roll").describe()).raw_description.workflow_execution_info
+        if info.first_run_id != info.execution.run_id:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        pytest.fail("the session never continued as new")
+    [meta] = [m for m in await executor.sessions() if m.session_id == "s-roll"]
+    assert meta.turns == 5

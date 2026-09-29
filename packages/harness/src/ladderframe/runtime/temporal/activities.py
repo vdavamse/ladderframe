@@ -43,12 +43,20 @@ def _archive(root_path: str, tasks: bool = False) -> SessionArchive:
     return runtime.task_archive() if tasks else runtime.session_archive()
 
 
+@dataclass
+class LoadedSession:
+    messages: list[ModelMessage]
+    meta: SessionMeta | None = None
+    """The stored meta when the latest snapshot was loaded (not with `snapshot_key`)."""
+
+
 @activity.defn(name="ladderframe.load_session")
-async def load_session(params: LoadSessionInput) -> list[ModelMessage]:
+async def load_session(params: LoadSessionInput) -> LoadedSession:
     archive = _archive(params.root_path, params.tasks)
     if params.snapshot_key:
-        return await archive.load_history(params.snapshot_key)
-    return (await archive.load(params.session_id))[1]
+        return LoadedSession(await archive.load_history(params.snapshot_key))
+    meta, messages = await archive.load(params.session_id)
+    return LoadedSession(messages, meta)
 
 
 @activity.defn(name="ladderframe.save_session")

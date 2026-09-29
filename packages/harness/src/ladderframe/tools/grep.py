@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 
@@ -56,11 +57,12 @@ async def Grep(ctx: RunContext[HarnessDeps], pattern: str, path: str | None = No
     if include:
         args.append(f"--glob={include}")
     args += ["--glob=!**/.git/**", "--", pattern, "." if requested.is_dir() else requested.name]
-    matches = (await run_rg(args, cwd, limit, _parse, pattern=pattern)).items
+    result = await run_rg(args, cwd, limit, _parse, pattern=pattern)
+    matches = result.items
 
     if not matches:
         return "No files found"
-    truncated = len(matches) == limit
+    truncated = result.truncated
     output = [f"Found {len(matches)} matches{' (more matches available)' if truncated else ''}"]
     current = ""
     for match in matches:
@@ -84,8 +86,15 @@ def _parse(line: str) -> Match | None:
     if record.get("type") != "match":
         return None
     data = record["data"]
-    text = (data.get("lines") or {}).get("text") or ""
-    return Match(relative((data.get("path") or {}).get("text", "")), data.get("line_number") or 0, _clip(text))
+    return Match(relative(_text(data.get("path"))), data.get("line_number") or 0, _clip(_text(data.get("lines"))))
+
+
+def _text(obj: dict[str, str] | None) -> str:
+    """rg --json gives `{"text": ...}`, or `{"bytes": <base64>}` for data that isn't valid UTF-8."""
+    obj = obj or {}
+    if "text" in obj:
+        return obj["text"]
+    return base64.b64decode(obj.get("bytes", "")).decode("utf-8", errors="replace")
 
 
 def _clip(text: str) -> str:

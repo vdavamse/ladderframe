@@ -67,11 +67,14 @@ class SessionArchive:
         return key
 
     async def load(self, session_id: str) -> tuple[SessionMeta | None, list[ModelMessage]]:
-        meta_raw = await self.store.get(self._key(session_id, "meta.json"))
+        meta = await self.load_meta(session_id)
         history_raw = await self.store.get(self.history_key(session_id))
-        meta = SessionMeta.model_validate_json(meta_raw) if meta_raw else None
         messages = ModelMessagesTypeAdapter.validate_json(history_raw) if history_raw else []
         return meta, messages
+
+    async def load_meta(self, session_id: str) -> SessionMeta | None:
+        raw = await self.store.get(self._key(session_id, "meta.json"))
+        return SessionMeta.model_validate_json(raw) if raw else None
 
     async def load_history(self, key: str) -> list[ModelMessage]:
         raw = await self.store.get(key)

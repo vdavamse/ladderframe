@@ -97,3 +97,105 @@ def test_vercel_ai_chat(client: TestClient) -> None:
     )
     history = client.get("/v1/sessions/chat-1/messages", headers=AUTH).json()
     assert len(history) == 2
+
+
+EVE = {**AUTH, "X-User-Id": "eve"}
+
+
+def test_other_users_cannot_touch_a_session(client: TestClient) -> None:
+    turn = client.post("/v1/sessions/s-ada/messages", json={"prompt": "secret"}, headers=AUTH).json()
+    assert client.get("/v1/sessions/s-ada/messages", headers=EVE).status_code == 404
+    assert client.get(f"/v1/sessions/s-ada/turns/{turn['turn_id']}", headers=EVE).status_code == 404
+    assert client.get(f"/v1/sessions/s-ada/turns/{turn['turn_id']}/events", headers=EVE).status_code == 404
+    assert client.post("/v1/sessions/s-ada/messages", json={"prompt": "hi"}, headers=EVE).status_code == 404
+    assert client.delete("/v1/sessions/s-ada", headers=EVE).status_code == 404
+    chat = {
+        "trigger": "submit-message",
+        "id": "s-ada",
+        "messages": [{"id": "m1", "role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+    }
+    assert client.post("/chat", json=chat, headers=EVE).status_code == 404
+    # ada's session is untouched
+    assert len(client.get("/v1/sessions/s-ada/messages", headers=AUTH).json()) == 2
+    [meta] = client.get("/v1/sessions", headers=AUTH).json()
+    assert meta["status"] == "open" and meta["turns"] == 1
+
+
+async def test_session_is_owned_before_its_first_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(FIXTURE_ROOT)
+    runtime = Runtime.load(FIXTURE_ROOT, model=echo_model())
+    runtime.object_store = MemoryObjectStore()
+    executor = InlineExecutor(runtime)
+    turn = await executor.submit("s-new", "hi", user="ada")
+    assert await executor.owner("s-new") == "ada"  # before the turn has saved the meta
+    await executor.wait("s-new", turn.turn_id)
+    assert await executor.owner("s-new") == "ada"
+    assert await executor.owner("s-unknown") is None
+
+
+def test_web_protocol_needs_auth_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(FIXTURE_ROOT)
+    runtime = Runtime.load(FIXTURE_ROOT, model=echo_model())
+    runtime.config.server.auth = "api-key"
+    runtime.config.server.api_keys = ["secret"]
+    runtime.config.server.protocols = ["web"]
+    with pytest.raises(ValueError, match="without authentication"):
+        create_app(runtime, InlineExecutor(runtime))
+
+
+def test_ready_hides_error_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(FIXTURE_ROOT)
+    runtime = Runtime.load(FIXTURE_ROOT, model=echo_model())
+    store = MemoryObjectStore()
+
+    async def down() -> None:
+        raise ConnectionError("https://internal-minio:9000/bucket?X-Amz-Signature=abc")
+
+    store.ping = down  # type: ignore[method-assign]
+    runtime.object_store = store
+    runtime.config.server.protocols = ["vercel-ai"]
+    with TestClient(create_app(runtime, InlineExecutor(runtime))) as test_client:
+        response = test_client.get("/ready")
+    assert response.status_code == 503
+    assert response.json() == {"ready": False, "object_store": "error"}
+
+
+async def test_close_during_a_turn_keeps_turns_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    release = asyncio.Event()
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            await release.wait()  # the first turn is still running when the session is closed
+        return ModelResponse(parts=[TextPart(f"turn with {len(messages)} messages")])
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+        yield str((await respond(messages, info)).parts[0].content)  # type: ignore[union-attr]
+
+    monkeypatch.chdir(FIXTURE_ROOT)
+    runtime = Runtime.load(FIXTURE_ROOT, model=FunctionModel(respond, stream_function=stream))
+    runtime.object_store = MemoryObjectStore()
+    executor = InlineExecutor(runtime)
+    first = await executor.submit("s-close", "one", user="ada")
+    await asyncio.sleep(0.05)
+    close = asyncio.create_task(executor.close_session("s-close"))
+    second = await executor.submit("s-close", "two", user="ada")
+    release.set()
+    await close
+    assert (await executor.wait("s-close", first.turn_id)).output == "turn with 1 messages"
+    assert (await executor.wait("s-close", second.turn_id)).output == "turn with 3 messages"  # saw turn one
+    assert len(await executor.history("s-close")) == 4
+
+
+async def test_submit_to_another_users_session_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ladderframe.runtime.executor import NotOwner
+
+    monkeypatch.chdir(FIXTURE_ROOT)
+    runtime = Runtime.load(FIXTURE_ROOT, model=echo_model())
+    runtime.object_store = MemoryObjectStore()
+    executor = InlineExecutor(runtime)
+    turn = await executor.submit("s-race", "mine", user="ada")
+    with pytest.raises(NotOwner):  # even before ada's turn has saved the meta
+        await executor.submit("s-race", "theirs", user="eve")
+    assert (await executor.wait("s-race", turn.turn_id)).status == "done"

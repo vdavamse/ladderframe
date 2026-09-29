@@ -3,12 +3,15 @@
     update  submit(prompt)   queue a turn, return its id immediately
     update  wait(turn_id)    block until the turn is done
     query   turn(turn_id)    turn status (and the event-stream offset its events start at)
+    query   owner()          the user the session belongs to
     signal  close()          finish the session
 
 Each turn runs the main agent (with pydantic-ai `TemporalDurability`, so model requests and tool
 calls are activities) and publishes its events to the workflow's `AgentEventStream`. After every
-turn the history is snapshotted to object storage; continue-as-new carries only that snapshot's key,
-so the workflow input never approaches Temporal's payload limit. After `idle_timeout` without
+turn the history is snapshotted to object storage; continue-as-new carries only that snapshot's key
+(and any turns submitted while the run was rolling over), so the workflow input never approaches
+Temporal's payload limit. The stream keeps the events of the last few turns, so a slow reader of one
+turn never sees the next turn's events; older turns report their events as expired. After `idle_timeout` without
 messages the workflow writes a final snapshot and completes; the next message resumes the session
 from the snapshot in a fresh run with the same workflow id.
 """
@@ -34,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
     from ..executor import TurnState
     from ..registry import get_runtime
     from .activities import (
+        LoadedSession,
         LoadSessionInput,
         SaveSessionInput,
         TurnMetricsInput,
@@ -48,6 +52,8 @@ _ACTIVITY = {
 }
 _MAX_TURNS_KEPT = 50
 """Finished turn states kept for `wait`/`turn` queries; older ones are dropped."""
+_EVENT_TURNS_KEPT = 5
+"""Turns whose events stay in the stream log for `events()` readers; older turns' events are dropped."""
 
 
 @dataclass
@@ -61,12 +67,18 @@ class SessionInput:
     title: str | None = None
     usage: RunUsage = field(default_factory=RunUsage)
     stream_state: WorkflowStreamState | None = None
+    pending: list[SubmitRequest] = field(default_factory=list)
+    """Turns submitted while the previous run was continuing as new."""
+    recent_turns: list[TurnState] = field(default_factory=list)
+    """The previous run's turns whose events are still in `stream_state`."""
 
 
 @dataclass
 class SubmitRequest:
     turn_id: str
     prompt: str
+    user: str | None = None
+    """Checked against the session's user, so a submit can't land in another user's session."""
 
 
 def session_workflow_id(agent: str, session_id: str) -> str:
@@ -78,10 +90,13 @@ class SessionWorkflow:
     @workflow.init
     def __init__(self, params: SessionInput) -> None:
         self.events = AgentEventStream(prior_state=params.stream_state)
-        self.queue: list[SubmitRequest] = []
-        self.turns: dict[str, TurnState] = {}
+        self.queue: list[SubmitRequest] = list(params.pending)
+        self.turns: dict[str, TurnState] = {t.turn_id: t for t in params.recent_turns}
+        self.turns.update({r.turn_id: TurnState(turn_id=r.turn_id) for r in params.pending})
+        self.rolling_over = False
         self.closing = False
         self.messages: list[ModelMessage] = []
+        self.user = params.user
 
     @workflow.run
     async def run(self, params: SessionInput) -> str:
@@ -90,9 +105,16 @@ class SessionWorkflow:
         continue_as_new = False
         stream_state: WorkflowStreamState | None = None
         async with self.events:
-            self.messages = await workflow.execute_activity(
+            loaded: LoadedSession = await workflow.execute_activity(
                 load_session, LoadSessionInput(params.root_path, params.session_id, params.snapshot_key), **_ACTIVITY
             )
+            self.messages = loaded.messages
+            if params.snapshot_key is None and loaded.meta is not None:
+                # Resumed after the previous run closed: keep counting from the stored totals.
+                state.turns, state.usage = loaded.meta.turns, loaded.meta.usage
+                state.title = state.title or loaded.meta.title
+            if loaded.meta is not None and loaded.meta.user is not None:
+                self.user = state.user = loaded.meta.user
             while True:
                 try:
                     await workflow.wait_condition(
@@ -104,12 +126,14 @@ class SessionWorkflow:
                 if not self.queue:
                     break  # closing
                 state = await self._run_turn(runtime, state, self.queue.pop(0))
-                if workflow.info().is_continue_as_new_suggested() and not self.queue:
+                if _continue_as_new_suggested() and not self.queue:
+                    # From here, `wait` for a turn that won't run in this run returns `TurnCarriedOver`
+                    # (the client retries on the next run), so it can't hold up the stream's drain.
+                    self.rolling_over = True
                     continue_as_new = True
                     break
 
             if continue_as_new:
-                await workflow.wait_condition(workflow.all_handlers_finished)
                 stream_state = self.events.stream.get_state()
             else:
                 await self._snapshot(state, status="closed")
@@ -126,16 +150,18 @@ class SessionWorkflow:
                     title=state.title,
                     usage=state.usage,
                     stream_state=stream_state,
+                    # Submitted while the stream drained; the next run picks them up.
+                    pending=self.queue,
+                    # States of the turns whose events the stream state still holds.
+                    recent_turns=[t for t in self.turns.values() if t.offset is not None],
                 )
             )
         return state.snapshot_key or ""
 
     async def _run_turn(self, runtime: Any, state: SessionInput, request: SubmitRequest) -> SessionInput:
         turn = self.turns[request.turn_id]
-        # Keep only the current turn's events in the stream log; earlier turns were already delivered.
-        offset = _stream_offset(self.events)
-        self.events.stream.truncate(offset)
-        turn.status, turn.offset = "running", offset
+        turn.status, turn.offset = "running", _stream_offset(self.events)
+        self._truncate_events()
         started = workflow.now()
         deps = HarnessDeps(
             root_path=state.root_path,
@@ -191,6 +217,16 @@ class SessionWorkflow:
         except ActivityError:
             workflow.logger.warning("could not record turn metrics")  # metrics must never end a session
 
+    def _truncate_events(self) -> None:
+        """Keep the events of the last `_EVENT_TURNS_KEPT` turns. Truncating a turn a client is still
+        reading would make the stream client restart from the oldest event left, i.e. another turn's."""
+        with_events = [t for t in self.turns.values() if t.offset is not None]
+        for turn in with_events[:-_EVENT_TURNS_KEPT]:
+            turn.offset, turn.events_expired = None, True
+        kept = with_events[-_EVENT_TURNS_KEPT:]
+        if kept:
+            self.events.stream.truncate(min(t.offset for t in kept if t.offset is not None))
+
     def _forget_old_turns(self) -> None:
         finished = [tid for tid, t in self.turns.items() if t.status in ("done", "failed")]
         for turn_id in finished[:-_MAX_TURNS_KEPT]:
@@ -208,6 +244,8 @@ class SessionWorkflow:
     def _validate_submit(self, request: SubmitRequest) -> None:
         if self.closing:
             raise ApplicationError("session is closing", type="SessionClosing")
+        if self.user is not None and request.user != self.user:
+            raise ApplicationError("session belongs to another user", type="NotOwner")
         if not request.prompt.strip():
             raise ApplicationError("empty prompt", type="EmptyPrompt")
 
@@ -215,16 +253,26 @@ class SessionWorkflow:
     async def wait(self, turn_id: str) -> TurnState:
         if turn_id not in self.turns:
             raise ApplicationError(f"unknown turn {turn_id!r}", type="UnknownTurn")
-        await workflow.wait_condition(lambda: self.turns[turn_id].status in ("done", "failed"))
+        await workflow.wait_condition(lambda: self.turns[turn_id].status in ("done", "failed") or self.rolling_over)
+        if self.turns[turn_id].status not in ("done", "failed"):
+            raise ApplicationError("the turn runs in the session's next run", type="TurnCarriedOver")
         return self.turns[turn_id]
 
     @workflow.query
     def turn(self, turn_id: str) -> TurnState | None:
         return self.turns.get(turn_id)
 
+    @workflow.query
+    def owner(self) -> str | None:
+        return self.user
+
     @workflow.signal
     def close(self) -> None:
         self.closing = True
+
+
+def _continue_as_new_suggested() -> bool:
+    return workflow.info().is_continue_as_new_suggested()
 
 
 def _stream_offset(events: AgentEventStream) -> int:

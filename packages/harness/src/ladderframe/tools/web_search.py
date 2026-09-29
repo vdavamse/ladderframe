@@ -123,8 +123,11 @@ async def call_mcp(
             response.raise_for_status()
     except httpx2.TimeoutException as exc:
         raise ModelRetry(f"{tool_name} request timed out") from exc
+    # Never include the exception text: it contains the URL, which can carry the API key (Exa's `exaApiKey`).
+    except httpx2.HTTPStatusError as exc:
+        raise ModelRetry(f"{tool_name} request failed with status code {exc.response.status_code}") from exc
     except httpx2.HTTPError as exc:
-        raise ModelRetry(f"{tool_name} request failed: {exc}") from exc
+        raise ModelRetry(f"{tool_name} request failed: {type(exc).__name__}") from exc
     return parse_response(response.text)
 
 

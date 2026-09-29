@@ -31,10 +31,16 @@ class TurnState(BaseModel):
     error: str | None = None
     offset: int | None = None
     """Event-stream offset where the turn's events start (Temporal executor)."""
+    events_expired: bool = False
+    """The turn's events were dropped from the stream to make room for later turns (Temporal executor)."""
 
 
 class TurnFailed(RuntimeError):
     pass
+
+
+class NotOwner(PermissionError):
+    """The session belongs to another user."""
 
 
 def new_id() -> str:
@@ -50,7 +56,8 @@ class Executor(ABC):
 
     @abstractmethod
     async def submit(self, session_id: str, prompt: str, *, user: str | None = None) -> TurnState:
-        """Queue a turn (creating or resuming the session) and return without waiting."""
+        """Queue a turn (creating or resuming the session) and return without waiting. Raises `NotOwner`
+        if the session belongs to another user."""
 
     @abstractmethod
     async def wait(self, session_id: str, turn_id: str) -> TurnState:
@@ -71,6 +78,11 @@ class Executor(ABC):
 
     @abstractmethod
     async def close_session(self, session_id: str) -> None: ...
+
+    @abstractmethod
+    async def owner(self, session_id: str) -> str | None:
+        """The user the session belongs to (`None` for an unknown or anonymous session), from its stored
+        meta or, before the first snapshot, from the live session."""
 
     async def send(self, session_id: str, prompt: str, *, user: str | None = None) -> TurnState:
         """Queue a turn and wait for it."""

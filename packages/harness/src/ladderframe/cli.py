@@ -101,7 +101,8 @@ def _executor(runtime: Any) -> Any:
 async def _turn(executor: Any, session_id: str, prompt: str, quiet: bool) -> int:
     from .runtime.executor import TurnFailed
 
-    turn = await executor.submit(session_id, prompt)
+    # The CLI is the operator: it may continue any user's session.
+    turn = await executor.submit(session_id, prompt, user=await executor.owner(session_id))
     if quiet:
         state = await executor.wait(session_id, turn.turn_id)
         print(state.output if state.status == "done" else f"error: {state.error}")

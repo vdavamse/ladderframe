@@ -21,8 +21,14 @@ from pydantic_ai.run import AgentRunResultEvent
 from ..core.deps import HarnessDeps
 from ..observability import metrics
 from ..storage.sessions import SessionArchive, SessionMeta, validate_session_id
-from .executor import Executor, NativeEvent, TurnFailed, TurnState, new_id
+from .executor import Executor, NativeEvent, NotOwner, TurnFailed, TurnState, new_id
 from .runtime import Runtime
+
+_MAX_TURNS_KEPT = 20
+"""Finished turns (with their events) kept per session for `wait`/`turn`/`events`; older ones are dropped."""
+_MAX_IDLE_SESSIONS = 1000
+"""In-memory sessions with nothing running that are kept; the least recently used are dropped (their
+history stays in the archive)."""
 
 
 @dataclass
@@ -39,6 +45,8 @@ class _Session:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turns: dict[str, _Turn] = field(default_factory=dict)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    user: str | None = None
+    """The user who started the session, until its first snapshot records it in the meta."""
 
 
 class InlineExecutor(Executor):
@@ -49,10 +57,24 @@ class InlineExecutor(Executor):
         self._sessions: dict[str, _Session] = {}
 
     def _session(self, session_id: str) -> _Session:
-        return self._sessions.setdefault(validate_session_id(session_id), _Session())
+        """The session's in-memory state, created if needed and marked most recently used."""
+        session_id = validate_session_id(session_id)
+        session = self._sessions.pop(session_id, None) or _Session()
+        self._sessions[session_id] = session
+        self._evict_idle()
+        return session
+
+    def _evict_idle(self) -> None:
+        idle = [sid for sid, s in self._sessions.items() if not s.tasks]
+        for session_id in idle[: max(0, len(idle) - _MAX_IDLE_SESSIONS)]:
+            del self._sessions[session_id]
 
     async def submit(self, session_id: str, prompt: str, *, user: str | None = None) -> TurnState:
         session = self._session(session_id)
+        if session.user is None:
+            session.user = user
+        elif user != session.user:  # checked with no await since the lookup, so two users can't race
+            raise NotOwner(session_id)
         turn = _Turn(TurnState(turn_id=new_id()), prompt)
         session.turns[turn.state.turn_id] = turn
         task = asyncio.create_task(self._run(session_id, session, turn, user))
@@ -91,6 +113,7 @@ class InlineExecutor(Executor):
                 messages = result.all_messages()
                 meta.turns += 1
                 meta.messages = len(messages)
+                meta.status = "open"
                 meta.updated_at = datetime.now(UTC)
                 meta.usage = meta.usage + result.usage
                 meta.title = meta.title or turn.prompt[:80]
@@ -101,9 +124,11 @@ class InlineExecutor(Executor):
             finally:
                 turn.changed.set()
                 turn.done.set()
+                _forget_old_turns(session)
 
     def _turn(self, session_id: str, turn_id: str) -> _Turn:
-        turn = self._session(session_id).turns.get(turn_id)
+        session = self._sessions.get(validate_session_id(session_id))
+        turn = session.turns.get(turn_id) if session else None
         if turn is None:
             raise KeyError(f"unknown turn {turn_id!r} in session {session_id!r}")
         return turn
@@ -138,8 +163,24 @@ class InlineExecutor(Executor):
         return await self.archive.list(user)
 
     async def close_session(self, session_id: str) -> None:
-        meta, messages = await self.archive.load(session_id)
+        session = self._session(session_id)
+        async with session.lock:  # after the running turn, so it can't overwrite the closed status
+            meta, messages = await self.archive.load(session_id)
+            if meta is not None:
+                meta.status = "closed"
+                await self.archive.save(meta, messages)
+        if not session.tasks and self._sessions.get(session_id) is session:
+            del self._sessions[session_id]
+
+    async def owner(self, session_id: str) -> str | None:
+        meta = await self.archive.load_meta(session_id)
         if meta is not None:
-            meta.status = "closed"
-            await self.archive.save(meta, messages)
-        self._sessions.pop(session_id, None)
+            return meta.user
+        session = self._sessions.get(validate_session_id(session_id))
+        return session.user if session else None
+
+
+def _forget_old_turns(session: _Session) -> None:
+    finished = [tid for tid, t in session.turns.items() if t.done.is_set()]
+    for turn_id in finished[:-_MAX_TURNS_KEPT]:
+        del session.turns[turn_id]
