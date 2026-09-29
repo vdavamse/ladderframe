@@ -32,6 +32,8 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import AgentStreamEvent, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.run import AgentRunResultEvent
 
+from ..observability import instrument_app, metrics
+from ..observability.metrics import HTTPMetricsMiddleware
 from ..runtime.executor import Executor, NativeEvent, TurnFailed, TurnState, new_id
 from ..runtime.runtime import Runtime
 from ..storage.sessions import SessionMeta, validate_session_id
@@ -79,6 +81,8 @@ def create_app(
                 await executor.aclose()
 
     app = FastAPI(title=f"ladderframe: {runtime.name}", lifespan=lifespan)
+    app.add_middleware(HTTPMetricsMiddleware)
+    instrument_app(runtime, app)
     app.state.runtime, app.state.executor, app.state.authenticate = runtime, executor, authenticate
 
     def session_id_or_404(session_id: str) -> str:
@@ -108,6 +112,13 @@ def create_app(
                 checks["temporal"] = f"error: {exc}"
         ok = all(v == "ok" for v in checks.values())
         return JSONResponse({"ready": ok, **checks}, status_code=200 if ok else 503)
+
+    if runtime.config.observability.metrics:
+
+        @app.get("/metrics", include_in_schema=False)
+        async def prometheus() -> Response:
+            body, content_type = metrics.exposition()
+            return Response(body, media_type=content_type)
 
     @app.get("/v1/sessions")
     async def list_sessions(principal: Auth) -> list[SessionMeta]:

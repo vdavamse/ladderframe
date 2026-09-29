@@ -61,4 +61,20 @@ async def save_session(params: SaveSessionInput) -> str:
     return await archive.save(meta, params.messages)
 
 
-ACTIVITIES = [load_session, save_session]
+@dataclass
+class TurnMetricsInput:
+    root_path: str
+    status: str
+    duration_seconds: float
+    usage: RunUsage | None = None
+
+
+@activity.defn(name="ladderframe.record_turn")
+async def record_turn(params: TurnMetricsInput) -> None:
+    """Metrics are process-local side effects, so the workflow reports them through an activity."""
+    from ...observability.metrics import record_turn as record
+
+    record(get_runtime(params.root_path).agent_name(), params.status, params.duration_seconds, params.usage)
+
+
+ACTIVITIES = [load_session, save_session, record_turn]

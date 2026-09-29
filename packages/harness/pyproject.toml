@@ -16,7 +16,16 @@ tavily = ["pydantic-ai-slim[tavily]>=2.51.0"]
 server = ["fastapi>=0.115", "uvicorn>=0.34", "pydantic-ai-slim[ui,ag-ui,web]>=2.51.0"]
 temporal = ["pydantic-ai-slim[temporal]>=2.51.0", "temporalio[aioboto3]>=1.33.0"]
 harness-capabilities = ["pydantic-ai-harness[prompt-injection-defender]>=0.36.0"]
-all = ["ladderframe[search,server,temporal,harness-capabilities]"]
+auth = ["pyjwt[crypto]>=2.9"]
+observability = [
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
+    "temporalio[opentelemetry]>=1.33.0",
+    "prometheus-client>=0.21",
+]
+logfire = ["logfire[fastapi]>=3.0"]
+evals = ["pydantic-evals>=1.0"]
+all = ["ladderframe[search,server,temporal,harness-capabilities,auth,observability,logfire,evals]"]
 
 [project.scripts]
 ladderframe = "ladderframe.cli:main"

@@ -54,6 +54,7 @@ uv run ladderframe --root agents/coder boot           # run etc/init.d (installs
 uv run ladderframe --root agents/coder cron           # supercronic with the merged etc/cron.d
 uv run ladderframe --root agents/coder serve          # HTTP API on :8080 (+ Temporal worker if configured)
 uv run ladderframe --root agents/coder worker         # Temporal worker only
+uv run ladderframe --root agents/coder eval           # run the evals/ datasets
 ```
 
 The root is `--root`, else `$LADDERFRAME_ROOT`, else the current directory. `run`, `repl` and `serve` use the
@@ -179,9 +180,54 @@ with `tool_packages: [my-package]`. Capabilities use the `ladderframe.capabiliti
 | `POST /ag-ui` | AG-UI; the thread id is the session id |
 | `GET /` | pydantic-ai chat UI — development only: it runs the agent directly, not through the executor |
 
-`server.protocols` selects `vercel-ai`, `ag-ui` and `web`. `server.auth: api-key` accepts
-`Authorization: Bearer <key>` or `X-API-Key`; `X-User-Id` names the end user. The UI protocols send the
-whole conversation, but only the latest user message is submitted: the session keeps its own history.
+`server.protocols` selects `vercel-ai`, `ag-ui` and `web`. The UI protocols send the whole conversation, but
+only the latest user message is submitted: the session keeps its own history.
+
+**Authentication** (`server.auth`, `/health`, `/ready` and `/metrics` stay open):
+
+| Mode | Credentials | End user |
+|---|---|---|
+| `none` | — (development) | `X-User-Id` |
+| `api-key` | `Authorization: Bearer <key>` or `X-API-Key`, checked against `server.api_keys` | `X-User-Id`, set by the calling service |
+| `jwt` | `Authorization: Bearer <jwt>` (extra `auth`), verified with `server.jwt`: one of `jwks_url` (OIDC), `public_key` or `secret`, plus `issuer`, `audience`, `algorithms`; `exp` is required | the `user_claim` claim (default `sub`) |
+
+## Observability
+
+```yaml
+observability:
+  tracing: otel              # none | otel (OTEL_EXPORTER_OTLP_* env) | logfire (LOGFIRE_TOKEN)
+  include_content: false     # keep prompts, responses and tool arguments out of spans
+  metrics: true              # Prometheus /metrics on the server (metrics_port for `ladderframe worker`)
+  temporal_metrics_port: 9464
+```
+
+- **Traces:** pydantic-ai agent runs, model requests and tool calls; Temporal workflows and activities
+  (Temporal's `TracingInterceptor`, or pydantic-ai's `LogfirePlugin` with Logfire); FastAPI requests with Logfire.
+- **Metrics:** `ladderframe_turns_total{agent,status}`, `ladderframe_turn_duration_seconds`,
+  `ladderframe_tokens_total{kind=input|output}`, `ladderframe_model_requests_total`, `ladderframe_tool_calls_total`,
+  `ladderframe_http_requests_total{method,route,status}`, `ladderframe_http_request_duration_seconds`. Under
+  Temporal, the session workflow reports turns through a `record_turn` activity. `temporal_metrics_port`
+  additionally exposes the Temporal SDK's metrics.
+
+## Evals — `evals/*.yaml`
+
+Each file in an agent root's `evals/` is a [pydantic-evals](https://ai.pydantic.dev/evals/) dataset: inputs
+are prompts, outputs are the agent's final answers.
+
+```bash
+uv run ladderframe --root agents/coder eval                      # every dataset; fails below 100% by default
+uv run ladderframe --root agents/coder eval basics --min-pass-rate 0.8
+```
+
+Every case is a fresh in-process turn (no session history, no Temporal). A case passes when all its
+assertion evaluators (`Contains`, `LLMJudge`, `MaxDuration`, ...) pass.
+
+## CI — `.github/workflows/ci.yml`
+
+`lint` (ruff, pyright) · `test` (pytest, including a local Temporal dev server and an S3 API) ·
+`check-agents` (`ladderframe check` for every agent and profile) · `evals` (only when the
+`ANTHROPIC_API_KEY` secret is set; `EVAL_MIN_PASS_RATE`, default 0.8) · `helm` (lint + template) ·
+`docker` (build `deploy/Dockerfile` for `coder`).
 
 ## Runtime and deployment
 
@@ -203,6 +249,18 @@ whole conversation, but only the latest user message is submitted: the session k
   the namespace retention (30 days in the compose file), or old workflows can no longer replay.
 - **MinIO images:** MinIO no longer publishes free container images; set `MINIO_IMAGE` / `MINIO_MC_IMAGE`
   for `deploy/docker-compose.yaml` to a build or registry you have access to.
+- **Kubernetes:** `deploy/helm/ladderframe` deploys one agent per release: a single replica with the
+  `Recreate` strategy (cron jobs never run twice during a rollout), `/health` and `/ready` probes, secrets
+  from `existingSecret`, an optional PVC for `var/`, and an optional Prometheus Operator `ServiceMonitor`.
+
+  ```bash
+  kubectl create secret generic coder-ladderframe --from-literal=ANTHROPIC_API_KEY=... \
+    --from-literal=LADDERFRAME_API_KEY=... --from-literal=S3_ACCESS_KEY=... --from-literal=S3_SECRET_KEY=...
+  helm install coder deploy/helm/ladderframe --set agent=coder \
+    --set image.repository=<registry>/ladderframe-coder --set existingSecret=coder-ladderframe
+  ```
+- **Bash is not sandboxed by ladderframe.** It runs as the pod's user with the pod's environment (including
+  secrets). Isolate it at the container level, or limit it with `permissions` rules.
 
 Durability notes:
 
@@ -219,7 +277,8 @@ Durability notes:
 |---|---|---|
 | 1 | Config + profiles, discovery, frontmatter, permissions, all 8 tools, skills, sub-agents, MCP, capabilities, inline runtime, CLI, init.d/cron.d | done |
 | 2 | Temporal sessions/sub-agents/events, object storage + payload offloading, FastAPI (sessions API, Vercel AI, AG-UI, web), API-key auth, `serve`/`worker` | done |
-| 3 | JWT/OIDC auth, OpenTelemetry/Logfire + metrics, Bash sandboxing, pydantic-evals in CI, Helm chart | planned |
+| 3 | JWT/OIDC auth, OpenTelemetry/Logfire tracing + Prometheus metrics, `ladderframe eval` + CI, Helm chart | done |
+| — | Bash sandboxing | out of scope for now (deployment-level) |
 
 ## Development
 

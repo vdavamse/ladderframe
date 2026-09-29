@@ -8,6 +8,7 @@ durable: a crash loses the turn in progress.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from pydantic_ai.messages import AgentStreamEvent, ModelMessage
 from pydantic_ai.run import AgentRunResultEvent
 
 from ..core.deps import HarnessDeps
+from ..observability import metrics
 from ..storage.sessions import SessionArchive, SessionMeta, validate_session_id
 from .executor import Executor, NativeEvent, TurnFailed, TurnState, new_id
 from .runtime import Runtime
@@ -61,6 +63,7 @@ class InlineExecutor(Executor):
     async def _run(self, session_id: str, session: _Session, turn: _Turn, user: str | None) -> None:
         async with session.lock:  # turns of one session run one at a time, in order
             turn.state.status = "running"
+            started = time.monotonic()
             meta, history = await self.archive.load(session_id)
             meta = meta or SessionMeta(session_id=session_id, agent=self.runtime.agent_name(), user=user)
 
@@ -83,6 +86,7 @@ class InlineExecutor(Executor):
                 )
             except Exception as exc:  # noqa: BLE001 — the failure is reported on the turn
                 turn.state.status, turn.state.error = "failed", f"{type(exc).__name__}: {exc}"
+                metrics.record_turn(self.runtime.agent_name(), "failed", time.monotonic() - started)
             else:
                 messages = result.all_messages()
                 meta.turns += 1
@@ -93,6 +97,7 @@ class InlineExecutor(Executor):
                 await self.archive.save(meta, messages)
                 turn.events.append(AgentRunResultEvent(result))
                 turn.state.status, turn.state.output = "done", result.output
+                metrics.record_turn(self.runtime.agent_name(), "done", time.monotonic() - started, result.usage)
             finally:
                 turn.changed.set()
                 turn.done.set()

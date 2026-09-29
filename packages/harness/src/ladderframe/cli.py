@@ -3,6 +3,7 @@
     ladderframe [--root DIR] [--profile NAME] run "prompt" [--session ID]
     ladderframe [--root DIR] repl [--session ID]
     ladderframe [--root DIR] check
+    ladderframe [--root DIR] eval [DATASET ...] [--min-pass-rate 0.9]
     ladderframe [--root DIR] boot [--dry-run]
     ladderframe [--root DIR] cron
     ladderframe [--root DIR] serve [--host H] [--port P] [--no-worker]
@@ -45,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("check", help="validate the agent root")
 
+    evals = sub.add_parser("eval", help="run the pydantic-evals datasets in <root>/evals")
+    evals.add_argument("datasets", nargs="*", help="dataset names (file stems); default: all")
+    evals.add_argument("--min-pass-rate", type=float, default=1.0, help="fail below this fraction (default 1.0)")
+    evals.add_argument("--concurrency", type=int, default=4)
+
     boot = sub.add_parser("boot", help="run etc/init.d scripts")
     boot.add_argument("--dry-run", action="store_true")
 
@@ -73,9 +79,12 @@ def _short_args(args: Any, limit: int = 80) -> str:
 
 
 def _load(args: argparse.Namespace):  # noqa: ANN202
+    from .observability import configure
     from .runtime.runtime import Runtime
 
-    return Runtime.load(args.root, args.profile)
+    runtime = Runtime.load(args.root, args.profile)
+    configure(runtime)
+    return runtime
 
 
 def _executor(runtime: Any) -> Any:
@@ -183,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
 
         exec_supercronic(build_crontab(runtime.root, runtime.share), runtime.root)
         return 0
+    if command == "eval":
+        return asyncio.run(_eval(args))
     if command == "serve":
         return _serve(args)
     if command == "worker":
@@ -191,6 +202,29 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(run_worker(_load(args)))
         return 0
     return 2
+
+
+async def _eval(args: argparse.Namespace) -> int:
+    from .evals import find_datasets, run_dataset
+    from .observability import configure
+    from .runtime.runtime import Runtime
+
+    # Evals always run in-process: fresh turns, no sessions, no Temporal.
+    runtime = Runtime.load(args.root, args.profile, durable=False)
+    configure(runtime)
+    paths = find_datasets(runtime, args.datasets)
+    if not paths:
+        print(f"no datasets in {runtime.root.path / 'evals'}", file=sys.stderr)
+        return 1
+    passed = total = 0
+    for path in paths:
+        result = await run_dataset(runtime, path, args.concurrency)
+        result.report.print(include_input=True, include_output=True)
+        print(f"{path.name}: {result.passed}/{result.total} cases passed\n")
+        passed, total = passed + result.passed, total + result.total
+    rate = passed / total if total else 1.0
+    print(f"overall: {passed}/{total} passed ({rate:.0%}), required {args.min_pass_rate:.0%}")
+    return 0 if rate >= args.min_pass_rate else 1
 
 
 def _serve(args: argparse.Namespace) -> int:

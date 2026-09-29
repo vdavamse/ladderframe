@@ -1,0 +1,15 @@
+cases:
+  - name: greets
+    inputs: hello
+    evaluators:
+      - Contains: hello back
+  - name: echoes
+    inputs: "echo:abc"
+    evaluators:
+      - Contains: "echo: abc"
+  - name: expected-to-fail
+    inputs: hello
+    evaluators:
+      - Contains: something else
+evaluators:
+  - MaxDuration: 30

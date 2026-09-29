@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 
 from fastapi import FastAPI
 
+from ..observability import configure as configure_observability
 from ..runtime.executor import Executor
 from ..runtime.inline import InlineExecutor
 from ..runtime.runtime import Runtime
@@ -13,6 +14,7 @@ from .app import create_app
 
 
 def build_app(runtime: Runtime, *, with_worker: bool = True) -> FastAPI:
+    configure_observability(runtime)
     if runtime.config.runtime.executor == "inline":
         return create_app(runtime, InlineExecutor(runtime))
 
@@ -35,5 +37,11 @@ async def run_worker(runtime: Runtime) -> None:
     from ..runtime.temporal.client import connect
     from ..runtime.temporal.worker import build_worker
 
+    configure_observability(runtime)
+    port = runtime.config.observability.metrics_port
+    if runtime.config.observability.metrics and port:
+        from ..observability.metrics import start_metrics_server
+
+        start_metrics_server(port)
     client = await connect(runtime)
     await build_worker(client, runtime).run()

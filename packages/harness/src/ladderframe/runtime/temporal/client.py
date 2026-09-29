@@ -8,6 +8,7 @@ from pydantic_ai.durable_exec.temporal import PydanticAIPlugin
 from temporalio.client import Client
 from temporalio.converter import DataConverter, ExternalStorage
 
+from ...observability import temporal_client_options
 from ...storage.object_store import payload_storage_driver
 from ..runtime import Runtime
 
@@ -22,11 +23,14 @@ async def connect(runtime: Runtime) -> Client:
             payload_size_threshold=storage.payload_threshold_bytes,
         ),
     )
+    extra = temporal_client_options(runtime)
     return await Client.connect(
         temporal.address,
         namespace=temporal.namespace,
         data_converter=data_converter,
-        plugins=[PydanticAIPlugin()],
+        plugins=[PydanticAIPlugin(), *extra.pop("plugins")],
+        interceptors=extra.pop("interceptors"),
+        **extra,
     )
 
 

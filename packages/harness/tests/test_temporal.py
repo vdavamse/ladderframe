@@ -138,6 +138,10 @@ async def test_task_queue_name_and_offloaded_payloads(env: tuple[Runtime, Tempor
     assert task_queue(runtime) == "ladderframe-fixture"
     # Histories above the (lowered) threshold went to object storage instead of workflow history.
     assert await runtime.object_store.list("payloads/")
+    # The workflow reported turn metrics through its record_turn activity.
+    from ladderframe.observability.metrics import TURNS
+
+    assert TURNS.labels("fixture", "done")._value.get() > 0
 
 
 async def test_http_api_over_temporal(env: tuple[Runtime, TemporalExecutor]) -> None:

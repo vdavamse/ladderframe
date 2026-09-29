@@ -1,0 +1,6 @@
+existingSecret: ladderframe-coder
+temporalMetricsPort: 9464
+serviceMonitor: {enabled: true}
+persistence: {enabled: true}
+env:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318

@@ -35,3 +35,18 @@ server:
   protocols: [vercel-ai]
   auth: api-key
   api_keys: ["${LADDERFRAME_API_KEY}"]
+
+observability:
+  tracing: otel                  # OTLP via OTEL_EXPORTER_OTLP_ENDPOINT; or logfire (LOGFIRE_TOKEN)
+  include_content: false         # keep prompts and tool arguments out of traces
+  metrics: true                  # /metrics
+  temporal_metrics_port: 9464    # Temporal SDK metrics
+
+# To use OIDC access tokens instead of API keys:
+# server:
+#   auth: jwt
+#   jwt:
+#     jwks_url: https://idp.example.com/.well-known/jwks.json
+#     issuer: https://idp.example.com/
+#     audience: ladderframe-coder
+#     user_claim: sub

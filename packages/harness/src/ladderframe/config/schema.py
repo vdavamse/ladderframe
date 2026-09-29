@@ -64,12 +64,45 @@ class StorageConfig(_Model):
     session_prefix: str = "sessions/"
 
 
+class JWTConfig(_Model):
+    """Bearer-token auth (OIDC access tokens or any signed JWT). Set exactly one key source."""
+
+    jwks_url: str | None = None
+    """JWKS endpoint of the identity provider, e.g. https://idp.example.com/.well-known/jwks.json."""
+    public_key: str | None = None
+    """PEM public key, for a fixed signing key instead of JWKS."""
+    secret: str | None = None
+    """Shared secret for HS256/HS384/HS512 tokens."""
+    issuer: str | None = None
+    audience: str | list[str] | None = None
+    algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
+    user_claim: str = "sub"
+    """Claim that identifies the end user (sessions are filtered by it)."""
+    leeway_seconds: int = 30
+
+
 class ServerConfig(_Model):
     host: str = "127.0.0.1"
     port: int = 8080
     protocols: list[Literal["vercel-ai", "ag-ui", "web"]] = Field(default_factory=lambda: ["web"])
     auth: Literal["none", "api-key", "jwt"] = "none"
     api_keys: list[str] = Field(default_factory=list)
+    jwt: JWTConfig = Field(default_factory=JWTConfig)
+
+
+class ObservabilityConfig(_Model):
+    tracing: Literal["none", "otel", "logfire"] = "none"
+    """`otel`: OTLP export configured by the standard OTEL_EXPORTER_OTLP_* variables.
+    `logfire`: Pydantic Logfire (LOGFIRE_TOKEN); also instruments FastAPI and Temporal metrics."""
+    service_name: str | None = None
+    """Defaults to `ladderframe-<agent>`."""
+    include_content: bool = True
+    """Record prompts, responses and tool arguments in spans. Turn off for sensitive data."""
+    metrics: bool = True
+    """Prometheus metrics: `/metrics` on the server, or `metrics_port` for `ladderframe worker`."""
+    metrics_port: int | None = None
+    temporal_metrics_port: int | None = None
+    """Expose the Temporal SDK's own Prometheus metrics (workflow/activity latencies) on this port."""
 
 
 class HarnessConfig(_Model):
@@ -108,6 +141,7 @@ class HarnessConfig(_Model):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
     @field_validator("capabilities")
     @classmethod

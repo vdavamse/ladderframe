@@ -22,7 +22,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai.durable_exec.temporal import AgentEventStream
@@ -33,7 +33,14 @@ with workflow.unsafe.imports_passed_through():
     from ...core.deps import HarnessDeps
     from ..executor import TurnState
     from ..registry import get_runtime
-    from .activities import LoadSessionInput, SaveSessionInput, load_session, save_session
+    from .activities import (
+        LoadSessionInput,
+        SaveSessionInput,
+        TurnMetricsInput,
+        load_session,
+        record_turn,
+        save_session,
+    )
 
 _ACTIVITY = {
     "start_to_close_timeout": timedelta(seconds=60),
@@ -129,6 +136,7 @@ class SessionWorkflow:
         offset = _stream_offset(self.events)
         self.events.stream.truncate(offset)
         turn.status, turn.offset = "running", offset
+        started = workflow.now()
         deps = HarnessDeps(
             root_path=state.root_path,
             workdir=str(runtime.workdir),
@@ -141,6 +149,7 @@ class SessionWorkflow:
             )
         except Exception as exc:  # noqa: BLE001 — a failed turn must not end the session
             turn.status, turn.error = "failed", f"{type(exc).__name__}: {exc}"
+            await self._metrics(state, "failed", started, None)
             return state
         self.messages = result.all_messages()
         state.turns += 1
@@ -150,6 +159,7 @@ class SessionWorkflow:
         # Done only once the snapshot is stored, so a caller that reads the history right after
         # `wait` returns sees this turn.
         turn.status, turn.output = "done", result.output
+        await self._metrics(state, "done", started, result.usage)
         self._forget_old_turns()
         return state
 
@@ -168,6 +178,18 @@ class SessionWorkflow:
             ),
             **_ACTIVITY,
         )
+
+    async def _metrics(self, state: SessionInput, status: str, started: Any, usage: RunUsage | None) -> None:
+        duration = (workflow.now() - started).total_seconds()
+        try:
+            await workflow.execute_activity(
+                record_turn,
+                TurnMetricsInput(state.root_path, status, duration, usage),
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+        except ActivityError:
+            workflow.logger.warning("could not record turn metrics")  # metrics must never end a session
 
     def _forget_old_turns(self) -> None:
         finished = [tid for tid, t in self.turns.items() if t.status in ("done", "failed")]

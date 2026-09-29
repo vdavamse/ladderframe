@@ -73,7 +73,12 @@ def check_runtime(runtime: Runtime) -> Report:
     if config.server.auth == "api-key" and not any(config.server.api_keys):
         report.errors.append("server.auth is api-key but server.api_keys is empty")
     if config.server.auth == "jwt":
-        report.errors.append("server.auth: jwt is not implemented yet")
+        jwt_config = config.server.jwt
+        sources = [s for s in (jwt_config.jwks_url, jwt_config.public_key, jwt_config.secret) if s]
+        if len(sources) != 1:
+            report.errors.append("server.auth is jwt: set exactly one of server.jwt.jwks_url, public_key, secret")
+        if not jwt_config.audience:
+            report.warnings.append("server.jwt.audience is unset: tokens issued for other services are accepted")
 
     if runtime.missing_env:
         report.warnings.append(f"undefined environment variables: {', '.join(sorted(runtime.missing_env))}")
