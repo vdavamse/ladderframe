@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ladderframe.fullname" . }}
+  labels: {{- include "ladderframe.labels" . | nindent 4 }}
+spec:
+  # One agent per pod. Recreate so two pods never run the cron jobs at the same time during a rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "ladderframe.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ladderframe.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      annotations:
+        {{- if .Values.secretEnv }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
+    spec:
+      serviceAccountName: {{ include "ladderframe.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - {name: LADDERFRAME_PROFILE, value: {{ .Values.profile | quote }}}
+            - {name: TEMPORAL_ADDRESS, value: {{ .Values.temporal.address | quote }}}
+            - {name: TEMPORAL_NAMESPACE, value: {{ .Values.temporal.namespace | quote }}}
+            - {name: S3_ENDPOINT, value: {{ .Values.storage.endpoint | quote }}}
+            - {name: S3_BUCKET, value: {{ .Values.storage.bucket | quote }}}
+            {{- range $name, $value := .Values.env }}
+            - {name: {{ $name }}, value: {{ $value | quote }}}
+            {{- end }}
+          {{- with (include "ladderframe.secretName" .) }}
+          envFrom:
+            - secretRef: {name: {{ . }}}
+          {{- end }}
+          ports:
+            - {name: http, containerPort: 8080}
+            {{- if .Values.temporalMetricsPort }}
+            - {name: temporal-metrics, containerPort: {{ .Values.temporalMetricsPort }}}
+            {{- end }}
+          livenessProbe:
+            httpGet: {path: {{ .Values.probes.liveness.path }}, port: http}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          readinessProbe:
+            httpGet: {path: {{ .Values.probes.readiness.path }}, port: http}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            - {name: var, mountPath: "/srv/agents/{{ .Values.agent }}/var"}
+          {{- end }}
+      {{- if .Values.persistence.enabled }}
+      volumes:
+        - name: var
+          persistentVolumeClaim: {claimName: {{ include "ladderframe.fullname" . }}}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

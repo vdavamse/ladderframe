@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+
+# Agent root runtime state
+agents/*/var/
+agents/*/tmp/
+packages/harness/tests/fixtures/*/var/
+packages/harness/tests/fixtures/*/tmp/

@@ -1,0 +1,80 @@
+# One release = one agent = one pod. The image is built per agent:
+#   docker build -f deploy/Dockerfile --build-arg AGENT=coder -t <registry>/ladderframe-coder:<tag> .
+# Agent name: the directory under agents/ baked into the image (--build-arg AGENT=...).
+agent: coder
+
+image:
+  repository: ladderframe-coder
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Profile overlay inside the image: etc/ladderframe.<profile>.yaml
+profile: prod
+
+temporal:
+  address: temporal-frontend.temporal.svc:7233
+  namespace: ladderframe
+
+storage:
+  endpoint: http://minio.minio.svc:9000
+  bucket: ladderframe
+
+# Secrets are read from an existing Secret (recommended), with keys such as
+# ANTHROPIC_API_KEY, LADDERFRAME_API_KEY, S3_ACCESS_KEY, S3_SECRET_KEY, GITHUB_TOKEN, LOGFIRE_TOKEN.
+existingSecret: ""
+# ...or created by the chart from these values (avoid for real credentials: they end up in Helm state).
+secretEnv: {}
+
+# Extra plain environment variables, e.g. OTEL_EXPORTER_OTLP_ENDPOINT.
+env: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Temporal SDK Prometheus metrics (observability.temporal_metrics_port in the agent config).
+temporalMetricsPort: null
+
+serviceMonitor:
+  enabled: false        # needs the Prometheus Operator CRDs
+  interval: 30s
+  labels: {}
+
+persistence:
+  # Mounts <root>/var (logs, local state). Sessions live in Temporal + object storage, so this is optional.
+  enabled: false
+  size: 1Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+resources:
+  requests: {cpu: 250m, memory: 512Mi}
+  limits: {memory: 2Gi}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: {drop: [ALL]}
+
+probes:
+  liveness: {path: /health, initialDelaySeconds: 20, periodSeconds: 20}
+  readiness: {path: /ready, initialDelaySeconds: 10, periodSeconds: 10}
+
+terminationGracePeriodSeconds: 60

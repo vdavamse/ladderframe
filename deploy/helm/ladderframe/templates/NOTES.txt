@@ -1,0 +1,9 @@
+ladderframe agent "{{ .Values.agent }}" deployed as {{ include "ladderframe.fullname" . }} (profile {{ .Values.profile }}).
+
+  kubectl port-forward svc/{{ include "ladderframe.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl localhost:{{ .Values.service.port }}/ready
+
+{{- if not (include "ladderframe.secretName" .) }}
+
+WARNING: no existingSecret / secretEnv set; the agent has no model API key or server API key.
+{{- end }}

@@ -1,0 +1,89 @@
+# Local/staging stack: self-hosted Temporal (+ its own Postgres and UI), MinIO, and one agent pod.
+#   docker compose -f deploy/docker-compose.yaml up --build
+# Pin image versions before using this beyond development.
+# Needs LADDERFRAME_API_KEY (the agent's API key); ports are published on 127.0.0.1 only.
+
+services:
+  temporal-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes: [temporal-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    depends_on:
+      temporal-postgres: {condition: service_healthy}
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: temporal-postgres
+      DEFAULT_NAMESPACE: ladderframe
+      DEFAULT_NAMESPACE_RETENTION: 30d
+    ports: ["127.0.0.1:7233:7233"]   # no auth: workflow histories contain user prompts
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["127.0.0.1:8233:8080"]
+
+  minio:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}   # MinIO no longer publishes free images; point this at your build/registry
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-ladderframe}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-ladderframe-secret}
+    volumes: [minio-data:/data]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      retries: 20
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:latest}
+    depends_on:
+      minio: {condition: service_healthy}
+    volumes: [./minio/lifecycle.json:/lifecycle.json:ro]
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${S3_BUCKET:-ladderframe} &&
+      mc ilm import local/${S3_BUCKET:-ladderframe} < /lifecycle.json
+      "
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-ladderframe}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-ladderframe-secret}
+
+  coder:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args: {AGENT: coder}
+    depends_on:
+      temporal: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
+    environment:
+      LADDERFRAME_PROFILE: prod
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: ladderframe
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-ladderframe}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-ladderframe}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-ladderframe-secret}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LADDERFRAME_API_KEY: ${LADDERFRAME_API_KEY:?set LADDERFRAME_API_KEY}
+    ports: ["127.0.0.1:8080:8080"]
+
+volumes:
+  temporal-db:
+  minio-data:

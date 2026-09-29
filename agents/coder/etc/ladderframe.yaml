@@ -1,0 +1,23 @@
+# Harness config for the `coder` agent. Merged over the built-in defaults;
+# etc/ladderframe.<profile>.yaml is merged on top when LADDERFRAME_PROFILE=<profile>.
+
+model: sonnet                       # alias, full id (claude-opus-5-5), or provider:model
+# model: {id: claude-opus-5-5, effort: high, settings: {max_tokens: 8000}}
+
+tools: [Read, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch, Hello]
+
+tool_settings:
+  Bash: {timeout_ms: 120000}
+  Hello: {greeting: Ahoj}
+
+permissions:
+  default: allow
+  deny:
+    - Bash(rm -rf *)
+    - Bash(sudo *)
+
+capabilities: []
+#  - prompt_injection_defender: {block_high_risk: true}
+
+limits:
+  request_limit: 60

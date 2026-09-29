@@ -1,0 +1,52 @@
+# Production overlay: LADDERFRAME_PROFILE=prod
+
+permissions:
+  default: deny
+  allow:
+    - Read
+    - Glob
+    - Grep
+    - Skill
+    - Agent
+    - WebSearch
+    - WebFetch
+    - Bash(git *)
+    - Bash(gh issue view *)
+
+capabilities:
+  - prompt_injection_defender: {block_high_risk: true}
+
+runtime:
+  executor: temporal
+  temporal:
+    address: ${TEMPORAL_ADDRESS:-temporal:7233}
+    namespace: ${TEMPORAL_NAMESPACE:-ladderframe}
+    session_idle_timeout: 7d
+
+storage:
+  endpoint: ${S3_ENDPOINT:-http://minio:9000}
+  bucket: ${S3_BUCKET:-ladderframe}
+  access_key: ${S3_ACCESS_KEY}
+  secret_key: ${S3_SECRET_KEY}
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  protocols: [vercel-ai]
+  auth: api-key
+  api_keys: ["${LADDERFRAME_API_KEY}"]
+
+observability:
+  tracing: otel                  # OTLP via OTEL_EXPORTER_OTLP_ENDPOINT; or logfire (LOGFIRE_TOKEN)
+  include_content: false         # keep prompts and tool arguments out of traces
+  metrics: true                  # /metrics
+  temporal_metrics_port: 9464    # Temporal SDK metrics
+
+# To use OIDC access tokens instead of API keys:
+# server:
+#   auth: jwt
+#   jwt:
+#     jwks_url: https://idp.example.com/.well-known/jwks.json
+#     issuer: https://idp.example.com/
+#     audience: ladderframe-coder
+#     user_claim: sub
