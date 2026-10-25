@@ -10,8 +10,11 @@ https://github.com/cline/cline/blob/main/evals/diff-edits/diff-apply/diff-06-26-
 from __future__ import annotations
 
 import difflib
+import os
 import re
+import stat
 import threading
+import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -64,16 +67,17 @@ def Edit(
         return str(exc)
 
     with file_lock(path):
+        info = stat_path(path)
         if oldString == "":
-            if path.exists():
+            if info is not None:
                 raise ModelRetry(EMPTY_OLD_STRING)
             content_old = ""
             bom, content_new = split_bom(newString)
             write_text(path, content_new, bom)
         else:
-            if not path.exists():
+            if info is None:
                 raise ModelRetry(f"File {path} not found")
-            if path.is_dir():
+            if stat.S_ISDIR(info.st_mode):
                 raise ModelRetry(f"Path is a directory, not a file: {path}")
             source_bom, content_old = read_text(path)
             ending = detect_line_ending(content_old)
@@ -88,8 +92,9 @@ def Edit(
 
     old_lines = normalize_line_endings(content_old)
     new_lines = normalize_line_endings(content_new)
-    diff = trim_diff(unified_diff(str(path), old_lines, new_lines))
-    additions, deletions = count_changes(old_lines, new_lines)
+    diff = unified_diff(str(path), old_lines, new_lines)
+    additions, deletions = count_changes(diff)
+    diff = trim_diff(diff)
     return ToolReturn(
         "Edit applied successfully.",
         metadata={"filepath": str(path), "diff": diff, "additions": additions, "deletions": deletions},
@@ -98,14 +103,28 @@ def Edit(
 
 # ---------------------------------------------------------------- file helpers shared with Write
 
-_locks: dict[str, threading.Lock] = {}
+_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _locks_guard = threading.Lock()
 
 
 def file_lock(path: Path) -> threading.Lock:
-    """One lock per file, so concurrent edits of the same file don't lose each other's changes."""
+    """One lock per file, so concurrent edits of the same file don't lose each other's changes.
+    The caller's reference keeps the lock alive while it is used; unused locks are dropped."""
     with _locks_guard:
-        return _locks.setdefault(str(path), threading.Lock())
+        lock = _locks.get(str(path))
+        if lock is None:
+            lock = _locks[str(path)] = threading.Lock()
+        return lock
+
+
+def stat_path(path: Path) -> os.stat_result | None:
+    """`None` if there is no such file. `Path.exists()` raises on other errors, e.g. an unsearchable parent."""
+    try:
+        return path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise ModelRetry(f"Cannot access {path}: {exc.strerror or exc}") from exc
 
 
 def split_bom(text: str) -> tuple[bool, str]:
@@ -118,11 +137,16 @@ def read_text(path: Path) -> tuple[bool, str]:
         return split_bom(path.read_bytes().decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise ModelRetry(f"Cannot edit {path}: it is not a UTF-8 text file") from exc
+    except OSError as exc:
+        raise ModelRetry(f"Cannot read {path}: {exc.strerror or exc}") from exc
 
 
 def write_text(path: Path, text: str, bom: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(((BOM if bom else "") + split_bom(text)[1]).encode("utf-8"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(((BOM if bom else "") + split_bom(text)[1]).encode("utf-8"))
+    except OSError as exc:  # e.g. a parent path is a file, or the file is read-only
+        raise ModelRetry(f"Cannot write {path}: {exc.strerror or exc}") from exc
 
 
 def normalize_line_endings(text: str) -> str:
@@ -137,10 +161,15 @@ def convert_to_line_ending(text: str, ending: str) -> str:
     return text if ending == "\n" else text.replace("\n", "\r\n")
 
 
+def _lines(text: str) -> list[str]:
+    """Lines with their `\\n`, split on `\\n` only like jsdiff (`str.splitlines` also splits on `\\f`, `\\r`, ...)."""
+    return re.findall(r"[^\n]*\n|[^\n]+$", text)
+
+
 def unified_diff(path: str, old: str, new: str) -> str:
     """A patch in the format of jsdiff's `createTwoFilesPatch`, which opencode puts in tool metadata."""
     out = [f"Index: {path}\n", "=" * 67 + "\n"]
-    lines = difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True), path, path)
+    lines = difflib.unified_diff(_lines(old), _lines(new), path, path)
     for line in lines:
         out.append(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
     if len(out) == 2:
@@ -148,13 +177,17 @@ def unified_diff(path: str, old: str, new: str) -> str:
     return "".join(out)
 
 
-def count_changes(old: str, new: str) -> tuple[int, int]:
-    """`(lines added, lines removed)`."""
+def count_changes(diff: str) -> tuple[int, int]:
+    """`(lines added, lines removed)` in a `unified_diff`, so the counts always agree with the patch.
+    (`difflib.ndiff` or a non-autojunk matcher take minutes on long runs of similar or repeated lines.)"""
     additions = deletions = 0
-    for line in difflib.ndiff(old.splitlines(), new.splitlines()):
-        if line.startswith("+ "):
+    in_hunks = False
+    for line in diff.split("\n"):
+        if line.startswith("@@"):
+            in_hunks = True
+        elif in_hunks and line.startswith("+"):
             additions += 1
-        elif line.startswith("- "):
+        elif in_hunks and line.startswith("-"):
             deletions += 1
     return additions, deletions
 
@@ -182,6 +215,8 @@ Replacer = Callable[[str, str], Iterator[str]]
 
 SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
 MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD = 0.65
+MAX_SCORED_LINE_LENGTH = 200
+"""Longer lines (minified code) are compared for equality only: `levenshtein` is quadratic in the line length."""
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -230,7 +265,12 @@ def _middle_similarity(original: list[str], start: int, size: int, search: list[
         longest = max(len(original_line), len(search_line))
         if longest == 0:
             continue
-        score = 1 - levenshtein(original_line, search_line) / longest
+        if original_line == search_line:
+            score = 1.0
+        elif longest > MAX_SCORED_LINE_LENGTH:
+            score = 0.0
+        else:
+            score = 1 - levenshtein(original_line, search_line) / longest
         if early_exit:
             similarity += score / lines_to_check
             if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:

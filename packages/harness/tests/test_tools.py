@@ -1,6 +1,7 @@
 """Built-in tools: parameters and output follow opencode's tools (see each module's docstring)."""
 
 import asyncio
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -472,3 +473,88 @@ def test_write_and_edit_rules_match_the_resolved_path(runtime: Runtime, work: Si
     assert "Permission denied" in str(Edit(work, "link/f.txt", "a", "b"))
     assert "Permission denied" in str(Write(work, "b", "link/f.txt"))
     assert (secret / "f.txt").read_text() == "a\n"
+
+
+def test_replace_other_fallback_matchers() -> None:
+    from ladderframe.tools.edit import (
+        context_aware_replacer,
+        indentation_flexible_replacer,
+        trimmed_boundary_replacer,
+    )
+
+    # Called directly: in `replace` an earlier, looser matcher usually finds these first.
+    nested = "class A:\n    def f(self):\n        pass\n"
+    assert list(indentation_flexible_replacer(nested, "def f(self):\n    pass")) == ["    def f(self):\n        pass"]
+    assert list(trimmed_boundary_replacer("x = 1\ny = 2\n", "\n\ny = 2\n\n")) == ["y = 2"]
+    block = "begin\n  one\n  two\n  three\nend\n"
+    assert list(context_aware_replacer(block, "begin\n  one\n  TWO\n  three\nend")) == [block.removesuffix("\n")]
+    assert list(context_aware_replacer(block, "begin\n  ONE\n  TWO\n  three\nend")) == []
+    # block anchor with several candidates: the most similar middle wins
+    two = "if a:\n    alpha = 1\nfi\nif a:\n    zzzzz = 9\nfi\n"
+    assert replace(two, "if a:\n    alpha = 2\nfi", "done") == "done\nif a:\n    zzzzz = 9\nfi\n"
+
+
+def test_block_anchor_skips_scoring_very_long_lines() -> None:
+    import time
+
+    content = "start\n" + "x" * 20_000 + "\nend\n"
+    begin = time.monotonic()
+    with pytest.raises(ValueError, match="Could not find oldString"):
+        replace(content, "start\n" + "y" * 20_000 + "\nend", "z")
+    assert time.monotonic() - begin < 1
+
+
+def test_diff_and_counts_split_on_newlines_only() -> None:
+    import time
+
+    from ladderframe.tools.edit import count_changes, unified_diff
+
+    diff = unified_diff("f", "a\x0cb\nc\n", "a\x0cb\nd\n")
+    assert "No newline" not in diff and " a\x0cb\n-c\n+d\n" in diff
+    assert count_changes(unified_diff("f", "a\rb\nc\n", "a\rb\nd\n")) == (1, 1)
+    assert count_changes(unified_diff("f", "x\n", "+++y\n--- z\n")) == (2, 1)  # not mistaken for headers
+    similar = "\n".join(f"value_{i} = compute({i}, alpha)" for i in range(2000))
+    unique = "\n".join(f"u{i}" for i in range(1000))
+    repeated = "\n".join(["}", ""] * 1000) + "\n" + unique  # slow for a non-autojunk SequenceMatcher
+    begin = time.monotonic()
+    assert count_changes(unified_diff("f", similar, similar.replace("alpha", "beta"))) == (2000, 2000)
+    count_changes(unified_diff("f", repeated, "\n".join(["}", "", "a"] * 1000)))
+    assert time.monotonic() - begin < 5  # difflib.ndiff took minutes here
+
+
+def test_write_and_edit_report_os_errors(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("x\n")
+    with pytest.raises(ModelRetry, match="Cannot write"):
+        Write(work, "y", "main.py/new.txt")
+    with pytest.raises(ModelRetry, match="Cannot write"):
+        Edit(work, "main.py/new.txt", "", "y")
+
+
+def test_write_over_a_non_utf8_file(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9\n")
+    Write(work, "cafe\n", "latin.txt")
+    assert (tmp_path / "latin.txt").read_text() == "cafe\n"
+
+
+def test_concurrent_edits_of_one_file_keep_every_change(work: SimpleNamespace, tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    (tmp_path / "many.txt").write_text("".join(f"line {i}\n" for i in range(20)))
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda i: Edit(work, "many.txt", f"line {i}\n", f"done {i}\n"), range(20)))
+    assert (tmp_path / "many.txt").read_text() == "".join(f"done {i}\n" for i in range(20))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_write_and_edit_report_unsearchable_directories(work: SimpleNamespace, tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "f.txt").write_text("a\n")
+    locked.chmod(0)
+    try:
+        with pytest.raises(ModelRetry, match="Cannot access"):
+            Edit(work, "locked/f.txt", "a", "b")
+        with pytest.raises(ModelRetry, match="Cannot access"):
+            Write(work, "b", "locked/f.txt")
+    finally:
+        locked.chmod(0o755)
