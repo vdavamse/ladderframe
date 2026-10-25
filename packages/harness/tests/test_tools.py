@@ -15,8 +15,10 @@ from ladderframe.tools import BUILTIN_TOOLS, Bash, Glob, Grep, Read, WebFetch, t
 from ladderframe.tools.agent import render_task
 from ladderframe.tools.base import to_pydantic_tool
 from ladderframe.tools.bash import _describe as _describe_bash
+from ladderframe.tools.edit import Edit, replace
 from ladderframe.tools.web_fetch import html_to_markdown, html_to_text
 from ladderframe.tools.web_search import parse_response
+from ladderframe.tools.write import Write
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
@@ -30,7 +32,9 @@ def work(runtime: Runtime, tmp_path: Path) -> SimpleNamespace:
 
 
 def test_builtin_names_match_claude_code() -> None:
-    assert set(BUILTIN_TOOLS) == {"Read", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"}
+    assert set(BUILTIN_TOOLS) == {
+        "Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"
+    }  # fmt: skip
 
 
 # ---------------------------------------------------------------- Read
@@ -367,3 +371,104 @@ def test_read_checks_the_symlink_target(runtime: Runtime, work: SimpleNamespace,
     runtime.config.permissions.deny = [f"Read({secret}/**)"]
     out = str(Read(work, "link.txt"))
     assert "Permission denied" in out and "hunter2" not in out
+
+
+# ---------------------------------------------------------------- Write / Edit
+
+
+def test_write_creates_and_overwrites(work: SimpleNamespace, tmp_path: Path) -> None:
+    created = Write(work, "a\nb\n", "deep/new.txt")
+    assert isinstance(created, ToolReturn) and created.return_value == "Wrote file successfully."
+    assert (tmp_path / "deep" / "new.txt").read_text() == "a\nb\n"
+    assert created.metadata["exists"] is False and created.metadata["additions"] == 2
+    replaced = Write(work, "a\nc\n", str(tmp_path / "deep" / "new.txt"))
+    assert isinstance(replaced, ToolReturn) and replaced.metadata["exists"] is True
+    assert "-b\n+c" in replaced.metadata["diff"]
+    with pytest.raises(ModelRetry, match="Path is a directory"):
+        Write(work, "x", "deep")
+
+
+def test_write_keeps_the_bom(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "bom.txt").write_bytes("\ufeffold".encode())
+    Write(work, "new", "bom.txt")
+    assert (tmp_path / "bom.txt").read_bytes() == "\ufeffnew".encode()
+
+
+def test_edit_replaces_a_unique_match(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("def f():\n    return 1\n")
+    result = Edit(work, "f.py", "return 1", "return 2")
+    assert isinstance(result, ToolReturn) and result.return_value == "Edit applied successfully."
+    assert (tmp_path / "f.py").read_text() == "def f():\n    return 2\n"
+    assert result.metadata["additions"] == 1 and result.metadata["deletions"] == 1
+    assert "-    return 1\n+    return 2" in result.metadata["diff"]
+    (tmp_path / "g.py").write_text("    a = 1\n    b = 2\n")
+    trimmed = Edit(work, "g.py", "b = 2", "b = 3")
+    assert isinstance(trimmed, ToolReturn) and " a = 1\n-b = 2\n+b = 3" in trimmed.metadata["diff"]
+
+
+def test_edit_errors(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("x = 1\nx = 1\n")
+    with pytest.raises(ModelRetry, match="identical"):
+        Edit(work, "f.txt", "x", "x")
+    with pytest.raises(ModelRetry, match="Found multiple matches"):
+        Edit(work, "f.txt", "x = 1", "x = 2")
+    with pytest.raises(ModelRetry, match="Could not find oldString"):
+        Edit(work, "f.txt", "y = 1", "y = 2")
+    with pytest.raises(ModelRetry, match="oldString cannot be empty"):
+        Edit(work, "f.txt", "", "z")
+    with pytest.raises(ModelRetry, match="not found"):
+        Edit(work, "missing.txt", "a", "b")
+    Edit(work, "f.txt", "x = 1", "x = 2", replaceAll=True)
+    assert (tmp_path / "f.txt").read_text() == "x = 2\nx = 2\n"
+
+
+def test_edit_with_empty_old_string_creates_the_file(work: SimpleNamespace, tmp_path: Path) -> None:
+    Edit(work, "new/file.txt", "", "hello\n")
+    assert (tmp_path / "new" / "file.txt").read_text() == "hello\n"
+
+
+def test_edit_keeps_crlf_and_bom(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "win.txt").write_bytes("\ufeffone\r\ntwo\r\nthree\r\n".encode())
+    Edit(work, "win.txt", "one\ntwo", "uno\ndos")
+    assert (tmp_path / "win.txt").read_bytes() == "\ufeffuno\r\ndos\r\nthree\r\n".encode()
+
+
+def test_edit_refuses_non_utf8(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9\n")
+    with pytest.raises(ModelRetry, match="not a UTF-8 text file"):
+        Edit(work, "latin.txt", "caf", "bar")
+
+
+def test_replace_fallback_matchers() -> None:
+    code = "def f():\n    if x:\n        return 1\n    return 2\n"
+    # wrong indentation: the line-trimmed matcher finds the whole lines, which newString replaces as given
+    assert replace(code, "if x:\n    return 1", "    if y:\n        return 3") == (
+        "def f():\n    if y:\n        return 3\n    return 2\n"
+    )
+    # collapsed whitespace
+    assert replace("a  =   1\n", "a = 1", "a = 2") == "a = 2\n"
+    # escaped newlines from a model that double-escaped
+    assert replace('s = "x"\ny\n', 's = \\"x\\"', 's = "z"') == 's = "z"\ny\n'
+    # a block whose middle line differs slightly is found by its first and last lines
+    block = "start {\n    alpha_value = 1\n}\n"
+    assert replace(block, "start {\n    alpha_valu = 1\n}", "start {}") == "start {}\n"
+    # literal replacement: no `$&`-style substitution
+    assert replace("a\n", "a", "$&") == "$&\n"
+
+
+def test_replace_refuses_a_disproportionate_match() -> None:
+    # the block anchors match one line further apart than oldString, and that extra line is huge
+    content = "first\nm1\nm2\n" + "z" * 700 + "\nlast\n"
+    with pytest.raises(ValueError, match="much larger than oldString"):
+        replace(content, "first\nm1\nm2\nlast", "x")
+
+
+def test_write_and_edit_rules_match_the_resolved_path(runtime: Runtime, work: SimpleNamespace, tmp_path: Path) -> None:
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "f.txt").write_text("a\n")
+    (tmp_path / "link").symlink_to(secret)
+    runtime.config.permissions.deny = [f"Edit({secret}/**)", f"Write({secret}/**)"]
+    assert "Permission denied" in str(Edit(work, "link/f.txt", "a", "b"))
+    assert "Permission denied" in str(Write(work, "b", "link/f.txt"))
+    assert (secret / "f.txt").read_text() == "a\n"

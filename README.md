@@ -13,7 +13,7 @@ ladderframe/
 │   └── src/ladderframe/
 │       ├── core/              # agent-root discovery, frontmatter, permissions, skill rendering, check
 │       ├── config/            # etc/ladderframe.yaml schema, loader, defaults.yaml
-│       ├── tools/             # Read Bash Glob Grep WebFetch WebSearch Agent Skill (+ @tool decorator)
+│       ├── tools/             # Read Write Edit Bash Glob Grep WebFetch WebSearch Agent Skill (+ @tool decorator)
 │       ├── mcp/               # mcp.yaml -> pydantic-ai MCPToolset
 │       ├── capabilities/      # YAML names -> pydantic-ai capabilities (prompt_injection_defender, ...)
 │       ├── runtime/           # Runtime, executors (inline, temporal/: session + sub-agent workflows)
@@ -69,7 +69,7 @@ file `etc/ladderframe.<profile>.yaml` is merged on top (mappings merge, lists re
 
 ```yaml
 model: sonnet                    # alias | claude-opus-5-5 | provider:model | {id, effort, settings}
-tools: [Read, Glob, Grep, Bash, Agent(code-reviewer, explore), Skill, WebFetch, WebSearch, Hello]
+tools: [Read, Write, Edit, Glob, Grep, Bash, Agent(code-reviewer, explore), Skill, WebFetch, WebSearch, Hello]
 tool_settings:
   Bash: {timeout_ms: 120000}
   WebSearch: {provider: exa}     # exa (default) | parallel
@@ -93,7 +93,8 @@ MCP tool globs such as `github_*`. A matching deny rule wins, then an allow rule
 `allowed-tools` grant for the current run), then `default`. Denied calls are reported back to the
 model; fully blocked tools are hidden from it.
 
-`Read(...)` rules match the absolute path after `..`, `//` and symlinks are resolved. `Bash(...)` rules
+`Read(...)`, `Write(...)` and `Edit(...)` rules match the absolute path after `..`, `//` and symlinks are
+resolved; unlike Claude Code, an `Edit` rule does not also cover `Write`, so deny both. `Bash(...)` rules
 match the whole command line, and `*` also matches `;`, `&&`, `|` and `$(…)`, so `Bash(git *)` allows
 `git status && curl …`. Don't rely on Bash rules to contain a command; a stricter Bash security model is
 planned.
@@ -107,6 +108,8 @@ prerequisite (the `ripgrep` wheel is a dependency; `ladderframe check` reports a
 | Tool | Parameters | Output |
 |---|---|---|
 | `Read` | `filePath`, `offset`, `limit` | `<path>…</path><type>file</type><content>` with `N: line` rows and a `(End of file - total N lines)` / `Use offset=N to continue` footer; directories as `<entries>`; images and PDFs up to 3.75 MB (5 MB base64) as attachments; nested `AGENTS.md` added as a `<system-reminder>` |
+| `Write` | `content`, `filePath` | `Wrote file successfully.`; creates parent directories, keeps an existing BOM; the diff goes in the result metadata |
+| `Edit` | `filePath`, `oldString`, `newString`, `replaceAll` | `Edit applied successfully.`; exact match first, then opencode's fallback matchers (trimmed lines, block anchors, whitespace, indentation, escapes); keeps BOM and CRLF; empty `oldString` creates a new file; refuses ambiguous or oversized matches |
 | `Glob` | `pattern`, `path` | absolute paths from `rg --files` (first 100) |
 | `Grep` | `pattern`, `path`, `include` | `Found N matches`, grouped by file, `  Line N: text` (first 100) |
 | `Bash` | `command`, `timeout` (ms, capped by `max_timeout_ms`, default 10 min), `workdir` | stdout+stderr, tail kept when long; timeouts in `<shell_metadata>`; no exit code |

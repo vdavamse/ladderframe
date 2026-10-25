@@ -50,10 +50,10 @@ class ReadSettings(BaseModel):
     """Stop reading once this many bytes of lines have been collected."""
 
 
-def _path_subject(args: dict[str, Any], deps: HarnessDeps) -> str | None:
+def path_subject(args: dict[str, Any], deps: HarnessDeps) -> str | None:
     """Rules match the absolute path with `..`, `.` and `//` removed, so `../../etc/x` can't slip past
     `Read(/etc/**)`. This runs in workflow code under Temporal, so it must not touch the filesystem;
-    `Read` checks the symlink-resolved path again itself."""
+    `Read`, `Write` and `Edit` check the symlink-resolved path again themselves."""
     path = args.get("filePath")
     if path is None:
         return None
@@ -61,7 +61,7 @@ def _path_subject(args: dict[str, Any], deps: HarnessDeps) -> str | None:
     return "/" + joined.lstrip("/") if joined.startswith("//") else joined
 
 
-@tool(settings=ReadSettings, subject=_path_subject, truncates=True, description=DESCRIPTION)
+@tool(settings=ReadSettings, subject=path_subject, truncates=True, description=DESCRIPTION)
 def Read(
     ctx: RunContext[HarnessDeps], filePath: str, offset: int | None = None, limit: int | None = None
 ) -> str | ToolReturn:

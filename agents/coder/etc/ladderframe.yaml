@@ -4,7 +4,7 @@
 model: sonnet                       # alias, full id (claude-opus-5-5), or provider:model
 # model: {id: claude-opus-5-5, effort: high, settings: {max_tokens: 8000}}
 
-tools: [Read, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch, Hello]
+tools: [Read, Write, Edit, Glob, Grep, Bash, Agent, Skill, WebFetch, WebSearch, Hello]
 
 tool_settings:
   Bash: {timeout_ms: 120000}
