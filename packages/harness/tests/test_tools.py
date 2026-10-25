@@ -1,6 +1,7 @@
 """Built-in tools: parameters and output follow opencode's tools (see each module's docstring)."""
 
 import asyncio
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,8 +16,10 @@ from ladderframe.tools import BUILTIN_TOOLS, Bash, Glob, Grep, Read, WebFetch, t
 from ladderframe.tools.agent import render_task
 from ladderframe.tools.base import to_pydantic_tool
 from ladderframe.tools.bash import _describe as _describe_bash
+from ladderframe.tools.edit import Edit, replace
 from ladderframe.tools.web_fetch import html_to_markdown, html_to_text
 from ladderframe.tools.web_search import parse_response
+from ladderframe.tools.write import Write
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
@@ -30,7 +33,9 @@ def work(runtime: Runtime, tmp_path: Path) -> SimpleNamespace:
 
 
 def test_builtin_names_match_claude_code() -> None:
-    assert set(BUILTIN_TOOLS) == {"Read", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"}
+    assert set(BUILTIN_TOOLS) == {
+        "Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Skill"
+    }  # fmt: skip
 
 
 # ---------------------------------------------------------------- Read
@@ -367,3 +372,189 @@ def test_read_checks_the_symlink_target(runtime: Runtime, work: SimpleNamespace,
     runtime.config.permissions.deny = [f"Read({secret}/**)"]
     out = str(Read(work, "link.txt"))
     assert "Permission denied" in out and "hunter2" not in out
+
+
+# ---------------------------------------------------------------- Write / Edit
+
+
+def test_write_creates_and_overwrites(work: SimpleNamespace, tmp_path: Path) -> None:
+    created = Write(work, "a\nb\n", "deep/new.txt")
+    assert isinstance(created, ToolReturn) and created.return_value == "Wrote file successfully."
+    assert (tmp_path / "deep" / "new.txt").read_text() == "a\nb\n"
+    assert created.metadata["exists"] is False and created.metadata["additions"] == 2
+    replaced = Write(work, "a\nc\n", str(tmp_path / "deep" / "new.txt"))
+    assert isinstance(replaced, ToolReturn) and replaced.metadata["exists"] is True
+    assert "-b\n+c" in replaced.metadata["diff"]
+    with pytest.raises(ModelRetry, match="Path is a directory"):
+        Write(work, "x", "deep")
+
+
+def test_write_keeps_the_bom(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "bom.txt").write_bytes("\ufeffold".encode())
+    Write(work, "new", "bom.txt")
+    assert (tmp_path / "bom.txt").read_bytes() == "\ufeffnew".encode()
+
+
+def test_edit_replaces_a_unique_match(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("def f():\n    return 1\n")
+    result = Edit(work, "f.py", "return 1", "return 2")
+    assert isinstance(result, ToolReturn) and result.return_value == "Edit applied successfully."
+    assert (tmp_path / "f.py").read_text() == "def f():\n    return 2\n"
+    assert result.metadata["additions"] == 1 and result.metadata["deletions"] == 1
+    assert "-    return 1\n+    return 2" in result.metadata["diff"]
+    (tmp_path / "g.py").write_text("    a = 1\n    b = 2\n")
+    trimmed = Edit(work, "g.py", "b = 2", "b = 3")
+    assert isinstance(trimmed, ToolReturn) and " a = 1\n-b = 2\n+b = 3" in trimmed.metadata["diff"]
+
+
+def test_edit_errors(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("x = 1\nx = 1\n")
+    with pytest.raises(ModelRetry, match="identical"):
+        Edit(work, "f.txt", "x", "x")
+    with pytest.raises(ModelRetry, match="Found multiple matches"):
+        Edit(work, "f.txt", "x = 1", "x = 2")
+    with pytest.raises(ModelRetry, match="Could not find oldString"):
+        Edit(work, "f.txt", "y = 1", "y = 2")
+    with pytest.raises(ModelRetry, match="oldString cannot be empty"):
+        Edit(work, "f.txt", "", "z")
+    with pytest.raises(ModelRetry, match="not found"):
+        Edit(work, "missing.txt", "a", "b")
+    Edit(work, "f.txt", "x = 1", "x = 2", replaceAll=True)
+    assert (tmp_path / "f.txt").read_text() == "x = 2\nx = 2\n"
+
+
+def test_edit_with_empty_old_string_creates_the_file(work: SimpleNamespace, tmp_path: Path) -> None:
+    Edit(work, "new/file.txt", "", "hello\n")
+    assert (tmp_path / "new" / "file.txt").read_text() == "hello\n"
+
+
+def test_edit_keeps_crlf_and_bom(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "win.txt").write_bytes("\ufeffone\r\ntwo\r\nthree\r\n".encode())
+    Edit(work, "win.txt", "one\ntwo", "uno\ndos")
+    assert (tmp_path / "win.txt").read_bytes() == "\ufeffuno\r\ndos\r\nthree\r\n".encode()
+
+
+def test_edit_refuses_non_utf8(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9\n")
+    with pytest.raises(ModelRetry, match="not a UTF-8 text file"):
+        Edit(work, "latin.txt", "caf", "bar")
+
+
+def test_replace_fallback_matchers() -> None:
+    code = "def f():\n    if x:\n        return 1\n    return 2\n"
+    # wrong indentation: the line-trimmed matcher finds the whole lines, which newString replaces as given
+    assert replace(code, "if x:\n    return 1", "    if y:\n        return 3") == (
+        "def f():\n    if y:\n        return 3\n    return 2\n"
+    )
+    # collapsed whitespace
+    assert replace("a  =   1\n", "a = 1", "a = 2") == "a = 2\n"
+    # escaped newlines from a model that double-escaped
+    assert replace('s = "x"\ny\n', 's = \\"x\\"', 's = "z"') == 's = "z"\ny\n'
+    # a block whose middle line differs slightly is found by its first and last lines
+    block = "start {\n    alpha_value = 1\n}\n"
+    assert replace(block, "start {\n    alpha_valu = 1\n}", "start {}") == "start {}\n"
+    # literal replacement: no `$&`-style substitution
+    assert replace("a\n", "a", "$&") == "$&\n"
+
+
+def test_replace_refuses_a_disproportionate_match() -> None:
+    # the block anchors match one line further apart than oldString, and that extra line is huge
+    content = "first\nm1\nm2\n" + "z" * 700 + "\nlast\n"
+    with pytest.raises(ValueError, match="much larger than oldString"):
+        replace(content, "first\nm1\nm2\nlast", "x")
+
+
+def test_write_and_edit_rules_match_the_resolved_path(runtime: Runtime, work: SimpleNamespace, tmp_path: Path) -> None:
+    secret = tmp_path / "secret"
+    secret.mkdir()
+    (secret / "f.txt").write_text("a\n")
+    (tmp_path / "link").symlink_to(secret)
+    runtime.config.permissions.deny = [f"Edit({secret}/**)", f"Write({secret}/**)"]
+    assert "Permission denied" in str(Edit(work, "link/f.txt", "a", "b"))
+    assert "Permission denied" in str(Write(work, "b", "link/f.txt"))
+    assert (secret / "f.txt").read_text() == "a\n"
+
+
+def test_replace_other_fallback_matchers() -> None:
+    from ladderframe.tools.edit import (
+        context_aware_replacer,
+        indentation_flexible_replacer,
+        trimmed_boundary_replacer,
+    )
+
+    # Called directly: in `replace` an earlier, looser matcher usually finds these first.
+    nested = "class A:\n    def f(self):\n        pass\n"
+    assert list(indentation_flexible_replacer(nested, "def f(self):\n    pass")) == ["    def f(self):\n        pass"]
+    assert list(trimmed_boundary_replacer("x = 1\ny = 2\n", "\n\ny = 2\n\n")) == ["y = 2"]
+    block = "begin\n  one\n  two\n  three\nend\n"
+    assert list(context_aware_replacer(block, "begin\n  one\n  TWO\n  three\nend")) == [block.removesuffix("\n")]
+    assert list(context_aware_replacer(block, "begin\n  ONE\n  TWO\n  three\nend")) == []
+    # block anchor with several candidates: the most similar middle wins
+    two = "if a:\n    alpha = 1\nfi\nif a:\n    zzzzz = 9\nfi\n"
+    assert replace(two, "if a:\n    alpha = 2\nfi", "done") == "done\nif a:\n    zzzzz = 9\nfi\n"
+
+
+def test_block_anchor_skips_scoring_very_long_lines() -> None:
+    import time
+
+    content = "start\n" + "x" * 20_000 + "\nend\n"
+    begin = time.monotonic()
+    with pytest.raises(ValueError, match="Could not find oldString"):
+        replace(content, "start\n" + "y" * 20_000 + "\nend", "z")
+    assert time.monotonic() - begin < 1
+
+
+def test_diff_and_counts_split_on_newlines_only() -> None:
+    import time
+
+    from ladderframe.tools.edit import count_changes, unified_diff
+
+    diff = unified_diff("f", "a\x0cb\nc\n", "a\x0cb\nd\n")
+    assert "No newline" not in diff and " a\x0cb\n-c\n+d\n" in diff
+    assert count_changes(unified_diff("f", "a\rb\nc\n", "a\rb\nd\n")) == (1, 1)
+    assert count_changes(unified_diff("f", "x\n", "+++y\n--- z\n")) == (2, 1)  # not mistaken for headers
+    similar = "\n".join(f"value_{i} = compute({i}, alpha)" for i in range(2000))
+    unique = "\n".join(f"u{i}" for i in range(1000))
+    repeated = "\n".join(["}", ""] * 1000) + "\n" + unique  # slow for a non-autojunk SequenceMatcher
+    begin = time.monotonic()
+    assert count_changes(unified_diff("f", similar, similar.replace("alpha", "beta"))) == (2000, 2000)
+    count_changes(unified_diff("f", repeated, "\n".join(["}", "", "a"] * 1000)))
+    assert time.monotonic() - begin < 5  # difflib.ndiff took minutes here
+
+
+def test_write_and_edit_report_os_errors(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "main.py").write_text("x\n")
+    with pytest.raises(ModelRetry, match="Cannot write"):
+        Write(work, "y", "main.py/new.txt")
+    with pytest.raises(ModelRetry, match="Cannot write"):
+        Edit(work, "main.py/new.txt", "", "y")
+
+
+def test_write_over_a_non_utf8_file(work: SimpleNamespace, tmp_path: Path) -> None:
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9\n")
+    Write(work, "cafe\n", "latin.txt")
+    assert (tmp_path / "latin.txt").read_text() == "cafe\n"
+
+
+def test_concurrent_edits_of_one_file_keep_every_change(work: SimpleNamespace, tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    (tmp_path / "many.txt").write_text("".join(f"line {i}\n" for i in range(20)))
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda i: Edit(work, "many.txt", f"line {i}\n", f"done {i}\n"), range(20)))
+    assert (tmp_path / "many.txt").read_text() == "".join(f"done {i}\n" for i in range(20))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_write_and_edit_report_unsearchable_directories(work: SimpleNamespace, tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "f.txt").write_text("a\n")
+    locked.chmod(0)
+    try:
+        with pytest.raises(ModelRetry, match="Cannot access"):
+            Edit(work, "locked/f.txt", "a", "b")
+        with pytest.raises(ModelRetry, match="Cannot access"):
+            Write(work, "b", "locked/f.txt")
+    finally:
+        locked.chmod(0o755)
