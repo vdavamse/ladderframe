@@ -172,6 +172,44 @@ mcpServers:
 
 Note: YAML reads the bare keys `on`, `off`, `yes`, `no` as booleans; don't use them as server names.
 
+### Parallel web search and page fetching
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) provides free web search
+and page extraction without an account or API key, with Fast mode for anonymous searches. It is
+suited to light use; an optional API key raises the rate limits.
+
+For search alone, the built-in `WebSearch` already supports `tool_settings.WebSearch.provider: parallel`
+(or `LADDERFRAME_WEBSEARCH_PROVIDER=parallel`). To expose Parallel's search **and** page-fetch tools,
+merge this entry into your agent root's `mcp.yaml` under `mcpServers`:
+
+```yaml
+mcpServers:
+  parallel:
+    url: https://search.parallel.ai/mcp
+    headers:
+      User-Agent: ladderframe
+    options: {read_timeout: 60}
+    tools: [web_search, web_fetch]
+```
+
+This adds `parallel_web_search` and `parallel_web_fetch` without changing the built-in `WebSearch`
+provider or `WebFetch` tool. MCP tools do not need entries in the config's `tools` list. If your
+permissions use `default: deny`, add both prefixed names to `permissions.allow`; matching deny rules
+still win. Sub-agents must opt in with `mcpServers: [parallel]` in their frontmatter.
+
+After the [quick start](#quick-start) installation and model credential setup, validate the config
+and try a research task:
+
+```bash
+uv run ladderframe --root agents/coder check
+uv run ladderframe --root agents/coder run "Use parallel_web_search to find the latest stable Python release, then parallel_web_fetch to read its release notes. Summarize the changes and cite the source URLs."
+```
+
+Use your own agent root in place of `agents/coder` if you added the entry elsewhere. `check` validates
+local configuration; it does not connect to the MCP server. To use an API key, add
+`Authorization: "Bearer ${PARALLEL_API_KEY}"` alongside `User-Agent` in `headers` and export the key
+before starting the harness.
+
 ## Custom tools
 
 Any `@tool` function in `tools/*.py` (root or share) is discovered; list its name under `tools:`.
